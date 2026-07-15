@@ -282,6 +282,7 @@ code, .mono { font-family: var(--font-mono); font-size: 0.9em; }
 .status-chip__dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 3px currentColor; opacity: 0.9; }
 .status-chip--listo { background: var(--color-success-subtle); color: var(--color-success); }
 .status-chip--proceso { background: var(--color-warning-subtle); color: var(--color-warning); }
+.status-chip--casi { background: var(--color-info-subtle); color: var(--color-info); }
 .status-chip--bloqueado { background: var(--color-danger-subtle); color: var(--color-danger); }
 
 /* ---- Badges / semáforo ---- */
@@ -653,6 +654,7 @@ function formatearTamanoArchivo(bytes) {
   return `${(n / 1024 ** i).toFixed(i === 0 ? 0 : 1)} ${unidades[i]}`;
 }
 function formatearEtiqueta(valor) { if (!valor) return '—'; const texto = String(valor).replace(/_/g, ' '); return texto.charAt(0).toUpperCase() + texto.slice(1); }
+function formatearTipoDocumento(doc) { return doc.tipo === 'OTRO' && doc.tipo_otro_descripcion ? doc.tipo_otro_descripcion : formatearEtiqueta(doc.tipo); }
 function iniciales(nombreCompleto) { if (!nombreCompleto) return '?'; return nombreCompleto.trim().split(/\s+/).slice(0, 2).map((p) => p[0]?.toUpperCase()).join(''); }
 
 // --------------------------------------------------------------
@@ -918,15 +920,36 @@ function miniBars(valores = []) {
   return `<div class="mini-bars">${valores.map((v) => `<div class="mini-bars__bar" style="height:${Math.max((v / max) * 100, 4)}%;" title="${v}"></div>`).join('')}</div>`;
 }
 
-/** Chip de estado (listo / proceso / bloqueado) para nivel de riesgo o etapa de proyecto. */
+/** Chip de etapa del proyecto según % de avance. Nunca muestra "bloqueado". */
 function statusChip(estado) {
   const CONFIG = {
-    listo: { clase: 'status-chip--listo', texto: 'Listo para exportar' },
     proceso: { clase: 'status-chip--proceso', texto: 'En proceso' },
-    bloqueado: { clase: 'status-chip--bloqueado', texto: 'Bloqueado' },
+    casi: { clase: 'status-chip--casi', texto: 'Ya casi' },
+    listo: { clase: 'status-chip--listo', texto: 'Liberado' },
   };
   const cfg = CONFIG[estado] || CONFIG.proceso;
   return `<span class="status-chip ${cfg.clase}"><span class="status-chip__dot"></span>${escapeHTML(cfg.texto)}</span>`;
+}
+/** Traduce % de avance a la clave de etapa: <80 proceso, 80-99 casi, 100 listo/liberado. */
+function etapaPorAvance(porcentaje) {
+  const n = Number(porcentaje) || 0;
+  if (n >= 100) return 'listo';
+  if (n >= 80) return 'casi';
+  return 'proceso';
+}
+
+/** Muestra/oculta y marca requerido un campo "especifica cuál" cuando el select vale 'OTRO'. */
+function wireSelectOtro(selectId, contenedorOtroId, inputOtroId) {
+  const select = document.getElementById(selectId);
+  const contenedor = document.getElementById(contenedorOtroId);
+  const input = document.getElementById(inputOtroId);
+  function actualizar() {
+    const esOtro = select.value === 'OTRO';
+    contenedor.classList.toggle('hidden', !esOtro);
+    if (input) { if (esOtro) input.setAttribute('required', ''); else input.removeAttribute('required'); }
+  }
+  select.addEventListener('change', actualizar);
+  actualizar();
 }
 
 /** Placeholder skeleton para estados de carga */
@@ -1069,7 +1092,7 @@ async function listarDocumentosEmpresa(empresaId, { tipo } = {}) {
   if (error) throw new Error(mensajeErrorSupabase(error));
   return data;
 }
-async function subirDocumento({ empresaId, archivo, tipo, fechaEmision, fechaVencimiento }) {
+async function subirDocumento({ empresaId, archivo, tipo, fechaEmision, fechaVencimiento, otroDescripcion }) {
   const usuario = getUsuarioActual();
   const ruta = construirRutaStorage(empresaId, archivo.name);
   const { error: uploadError } = await supabase.storage.from(BUCKETS.DOCUMENTOS).upload(ruta, archivo);
@@ -1077,6 +1100,7 @@ async function subirDocumento({ empresaId, archivo, tipo, fechaEmision, fechaVen
   const { data, error } = await supabase.from('documentos').insert({
     empresa_id: empresaId, tipo, nombre_archivo: archivo.name, ruta_storage: ruta, mime_type: archivo.type, tamano_bytes: archivo.size,
     fecha_emision: fechaEmision || null, fecha_vencimiento: fechaVencimiento || null, subido_por: usuario.id,
+    tipo_otro_descripcion: tipo === 'OTRO' ? (otroDescripcion || null) : null,
   }).select().single();
   if (error) throw new Error(mensajeErrorSupabase(error));
   await registrarHistorial({ empresaId, accion: 'documento_subido', entidadTipo: 'documento', entidadId: data.id, detalle: { tipo, nombre_archivo: archivo.name } });
@@ -1506,15 +1530,15 @@ async function vistaAdminDashboard() {
   });
 
   const empresas = await listarEmpresas();
-  const listas = empresas.filter((e) => e.porcentaje_avance >= 90).length;
-  const enProceso = empresas.filter((e) => e.porcentaje_avance > 20 && e.porcentaje_avance < 90).length;
-  const bloqueadas = empresas.filter((e) => e.porcentaje_avance <= 20).length;
+  const enProceso = empresas.filter((e) => etapaPorAvance(e.porcentaje_avance) === 'proceso').length;
+  const yaCasi = empresas.filter((e) => etapaPorAvance(e.porcentaje_avance) === 'casi').length;
+  const liberadas = empresas.filter((e) => etapaPorAvance(e.porcentaje_avance) === 'listo').length;
   document.getElementById('panel-avance').innerHTML = `
     ${progressRing({ porcentaje: kpis.avancePromedio, tamano: 96, grosor: 9 })}
     <div class="flex-col gap-3" style="flex:1;">
-      <div class="flex justify-between items-center"><span class="text-sm">${statusChip('listo')}</span><span class="font-semibold text-sm">${listas} empresa(s)</span></div>
       <div class="flex justify-between items-center"><span class="text-sm">${statusChip('proceso')}</span><span class="font-semibold text-sm">${enProceso} empresa(s)</span></div>
-      <div class="flex justify-between items-center"><span class="text-sm">${statusChip('bloqueado')}</span><span class="font-semibold text-sm">${bloqueadas} empresa(s)</span></div>
+      <div class="flex justify-between items-center"><span class="text-sm">${statusChip('casi')}</span><span class="font-semibold text-sm">${yaCasi} empresa(s)</span></div>
+      <div class="flex justify-between items-center"><span class="text-sm">${statusChip('listo')}</span><span class="font-semibold text-sm">${liberadas} empresa(s)</span></div>
     </div>`;
   activarProgressRings(document.getElementById('panel-avance'));
 
@@ -1563,7 +1587,7 @@ async function vistaAdminEmpresas() {
     columnas: [
       { clave: 'razon_social', titulo: 'Empresa', ordenable: true, render: (f) => `<div class="flex-col"><span class="font-medium">${escapeHTML(f.razon_social)}</span><span class="text-xs text-tertiary">${escapeHTML(f.categoria_producto || '—')}</span></div>` },
       { clave: 'estado_mx', titulo: 'Ubicación', render: (f) => escapeHTML([f.ciudad, f.estado_mx].filter(Boolean).join(', ') || '—') },
-      { clave: 'porcentaje_avance', titulo: 'Avance', ordenable: true, render: (f) => `<div class="flex items-center gap-3"><span class="font-semibold text-sm">${formatearPorcentaje(f.porcentaje_avance)}</span>${statusChip(f.porcentaje_avance >= 90 ? 'listo' : f.porcentaje_avance > 20 ? 'proceso' : 'bloqueado')}</div>` },
+      { clave: 'porcentaje_avance', titulo: 'Avance', ordenable: true, render: (f) => `<div class="flex items-center gap-3"><span class="font-semibold text-sm">${formatearPorcentaje(f.porcentaje_avance)}</span>${statusChip(etapaPorAvance(f.porcentaje_avance))}</div>` },
       { clave: 'acciones', titulo: '', render: (f) => `<button class="btn btn--sm btn--secondary" data-editar="${f.id}">Editar</button>` },
     ], porPagina: 10, textoVacio: 'Aún no hay empresas registradas.',
   });
@@ -1679,22 +1703,24 @@ async function vistaAdminPendientes() {
   const tabla = crearTabla({
     contenedor,
     columnas: [
-      { clave: 'titulo', titulo: 'Título', ordenable: true, render: (f) => escapeHTML(f.titulo) },
+      { clave: 'titulo', titulo: 'Título', ordenable: true, render: (f) => `<button class="btn btn--ghost btn--sm" data-editar="${f.id}" style="padding:0; height:auto; font-weight:500;">${escapeHTML(f.titulo)}</button>` },
       { clave: 'prioridad', titulo: 'Prioridad', render: (f) => badgePrioridad(f.prioridad) },
       { clave: 'responsable', titulo: 'Responsable', render: (f) => escapeHTML(f.usuarios?.nombre_completo || '—') },
       { clave: 'fecha_limite', titulo: 'Fecha límite', ordenable: true, render: (f) => formatearFecha(f.fecha_limite) },
       { clave: 'estado', titulo: 'Estado', render: (f) => badgeEstadoPendiente(f.estado) },
-      { clave: 'acciones', titulo: '', render: (f) => esAdmin() ? (f.estado === 'completado' ? `<button class="btn btn--sm btn--secondary" data-reabrir="${f.id}">Reabrir</button>` : `<button class="btn btn--sm btn--secondary" data-cerrar="${f.id}">Cerrar</button>`) : '' },
-    ], porPagina: 10, textoVacio: 'Esta empresa no tiene pendientes registrados.',
+      { clave: 'acciones', titulo: '', render: (f) => f.estado === 'completado' ? `<button class="btn btn--sm btn--secondary" data-reabrir="${f.id}">Reabrir</button>` : `<button class="btn btn--sm btn--secondary" data-cerrar="${f.id}">Cerrar</button>` },
+    ], porPagina: 10, textoVacio: 'Esta empresa no tiene pendientes registrados. Puede que el proveedor aún no cree ninguno.',
   });
 
+  let pendientesActuales = [];
   async function recargar() {
     const empresaId = selectEmpresa.value;
     if (!empresaId) return;
-    const pendientes = await listarPendientesEmpresa(empresaId, filtroEstado ? { estado: filtroEstado } : {});
-    tabla.setDatos(pendientes);
+    pendientesActuales = await listarPendientesEmpresa(empresaId, filtroEstado ? { estado: filtroEstado } : {});
+    tabla.setDatos(pendientesActuales);
     contenedor.querySelectorAll('[data-cerrar]').forEach((btn) => btn.addEventListener('click', async () => { await cerrarPendiente(btn.dataset.cerrar, empresaId); toast.exito('Pendiente cerrado.'); await recargar(); }));
     contenedor.querySelectorAll('[data-reabrir]').forEach((btn) => btn.addEventListener('click', async () => { await reabrirPendiente(btn.dataset.reabrir, empresaId); toast.exito('Pendiente reabierto.'); await recargar(); }));
+    contenedor.querySelectorAll('[data-editar]').forEach((btn) => btn.addEventListener('click', () => abrirModalEdicion(pendientesActuales.find((p) => p.id === btn.dataset.editar))));
   }
   selectEmpresa.addEventListener('change', recargar);
   if (empresas.length) await recargar();
@@ -1705,7 +1731,6 @@ async function vistaAdminPendientes() {
   }));
 
   document.getElementById('btn-nuevo-pendiente').addEventListener('click', () => {
-    if (!esAdmin()) return;
     const cuerpoHTML = `
       <form id="form-pendiente" class="flex-col gap-4">
         <div class="field"><label class="field__label">Título *</label><input class="input" name="titulo" required /></div>
@@ -1729,7 +1754,54 @@ async function vistaAdminPendientes() {
       ],
     });
   });
+
+  /** Edición completa — abre al hacer clic en el título. Aquí el admin ve y
+      modifica también los pendientes creados por el propio proveedor. */
+  function abrirModalEdicion(pendiente) {
+    const cuerpoHTML = `
+      <form id="form-editar-pendiente" class="flex-col gap-4">
+        <div class="field"><label class="field__label">Título *</label><input class="input" name="titulo" value="${escapeHTML(pendiente.titulo)}" required /></div>
+        <div class="field"><label class="field__label">Descripción</label><textarea class="textarea" name="descripcion">${escapeHTML(pendiente.descripcion || '')}</textarea></div>
+        <div class="grid gap-3" style="grid-template-columns: 1fr 1fr;">
+          <div class="field"><label class="field__label">Prioridad</label>
+            <select class="select" name="prioridad">
+              <option value="baja" ${pendiente.prioridad === 'baja' ? 'selected' : ''}>Baja</option>
+              <option value="media" ${pendiente.prioridad === 'media' ? 'selected' : ''}>Media</option>
+              <option value="alta" ${pendiente.prioridad === 'alta' ? 'selected' : ''}>Alta</option>
+              <option value="critica" ${pendiente.prioridad === 'critica' ? 'selected' : ''}>Crítica</option>
+            </select></div>
+          <div class="field"><label class="field__label">Estatus</label>
+            <select class="select" name="estado">
+              <option value="pendiente" ${pendiente.estado === 'pendiente' ? 'selected' : ''}>Pendiente</option>
+              <option value="en_proceso" ${pendiente.estado === 'en_proceso' ? 'selected' : ''}>En proceso</option>
+              <option value="en_revision" ${pendiente.estado === 'en_revision' ? 'selected' : ''}>En revisión</option>
+              <option value="completado" ${pendiente.estado === 'completado' ? 'selected' : ''}>Completado</option>
+              <option value="cancelado" ${pendiente.estado === 'cancelado' ? 'selected' : ''}>Cancelado</option>
+            </select></div>
+        </div>
+        <div class="grid gap-3" style="grid-template-columns: 1fr 1fr;">
+          <div class="field"><label class="field__label">Fecha límite</label><input class="input" type="date" name="fecha_limite" value="${pendiente.fecha_limite || ''}" /></div>
+          <div class="field"><label class="field__label">Responsable</label>
+            <select class="select" name="responsable_id"><option value="">Sin asignar</option>${usuariosStaff.map((u) => `<option value="${u.id}" ${pendiente.responsable_id === u.id ? 'selected' : ''}>${escapeHTML(u.nombre_completo)}</option>`).join('')}</select></div>
+        </div>
+      </form>`;
+    abrirModal({
+      titulo: 'Editar pendiente', cuerpoHTML, anchoMax: '600px',
+      acciones: [
+        { texto: 'Cancelar', variante: 'secondary', onClick: (cerrar) => cerrar() },
+        { texto: 'Guardar cambios', variante: 'primary', onClick: async (cerrar) => {
+          const datos = Object.fromEntries(new FormData(document.getElementById('form-editar-pendiente')).entries());
+          if (!esRequerido(datos.titulo)) return toast.error('El título es obligatorio.');
+          try {
+            await actualizarPendiente(pendiente.id, selectEmpresa.value, { ...datos, responsable_id: datos.responsable_id || null, fecha_limite: datos.fecha_limite || null, porcentaje: datos.estado === 'completado' ? 100 : pendiente.porcentaje });
+            toast.exito('Pendiente actualizado.'); cerrar(); await recargar();
+          } catch (err) { toast.error(err.message); }
+        } },
+      ],
+    });
+  }
 }
+
 
 // --------------------------------------------------------------
 // VISTAS ADMIN — documentos, productos, comentarios, historial, configuración
@@ -1752,6 +1824,7 @@ async function vistaAdminDocumentos() {
           <div class="field"><label class="field__label">Fecha de emisión</label><input class="input" type="date" id="input-emision" /></div>
           <div class="field"><label class="field__label">Fecha de vencimiento</label><input class="input" type="date" id="input-vencimiento" /></div>
         </div>
+        <div class="field hidden" id="campo-otro-tipo"><label class="field__label">Especifica qué tipo de documento es *</label><input class="input" id="input-otro-tipo" placeholder="Ej. Permiso de exportación estatal" /></div>
         <div id="dropzone-root"></div>
       </div>
     </div>
@@ -1768,7 +1841,7 @@ async function vistaAdminDocumentos() {
     contenedor,
     columnas: [
       { clave: 'nombre_archivo', titulo: 'Archivo', ordenable: true, render: (f) => `<button class="btn btn--ghost btn--sm" data-ver="${f.id}" style="padding:0; height:auto; font-weight:500;">${escapeHTML(f.nombre_archivo)}</button>` },
-      { clave: 'tipo', titulo: 'Tipo', render: (f) => escapeHTML(formatearEtiqueta(f.tipo)) },
+      { clave: 'tipo', titulo: 'Tipo', render: (f) => escapeHTML(formatearTipoDocumento(f)) },
       { clave: 'tamano_bytes', titulo: 'Tamaño', render: (f) => formatearTamanoArchivo(f.tamano_bytes) },
       { clave: 'fecha_vencimiento', titulo: 'Vence', render: (f) => formatearFecha(f.fecha_vencimiento) },
       { clave: 'estado', titulo: 'Estado', render: (f) => badgeSemaforo(f.estado) },
@@ -1789,6 +1862,7 @@ async function vistaAdminDocumentos() {
   if (empresas.length) await recargar();
 
   if (esAdmin()) {
+    wireSelectOtro('input-tipo', 'campo-otro-tipo', 'input-otro-tipo');
     crearDropzone({
       contenedor: document.getElementById('dropzone-root'), bucketId: BUCKETS.DOCUMENTOS, multiple: true, accept: '.pdf,.jpg,.jpeg,.png,.webp,.mp4,.mov,.doc,.docx,.xls,.xlsx',
       onArchivosValidos: async (archivos) => {
@@ -1797,7 +1871,9 @@ async function vistaAdminDocumentos() {
         const tipo = document.getElementById('input-tipo').value;
         const fechaEmision = document.getElementById('input-emision').value;
         const fechaVencimiento = document.getElementById('input-vencimiento').value;
-        for (const archivo of archivos) { try { await subirDocumento({ empresaId, archivo, tipo, fechaEmision, fechaVencimiento }); } catch (err) { toast.error(`${archivo.name}: ${err.message}`); } }
+        const otroDescripcion = document.getElementById('input-otro-tipo').value.trim();
+        if (tipo === 'OTRO' && !otroDescripcion) return toast.error('Especifica qué tipo de documento es.');
+        for (const archivo of archivos) { try { await subirDocumento({ empresaId, archivo, tipo, fechaEmision, fechaVencimiento, otroDescripcion }); } catch (err) { toast.error(`${archivo.name}: ${err.message}`); } }
         toast.exito('Documento(s) subido(s) correctamente.'); await recargar();
       },
     });
@@ -2031,7 +2107,7 @@ async function vistaProveedorDashboard() {
   const pendientesAbiertos = pendientes.filter((p) => !['completado', 'cancelado'].includes(p.estado));
   const certificaciones = await listarCertificacionesPorVencer({ empresaId, dias: 30 });
 
-  const estadoEtapa = empresa.porcentaje_avance >= 90 ? 'listo' : empresa.porcentaje_avance > 20 ? 'proceso' : 'bloqueado';
+  const estadoEtapa = etapaPorAvance(empresa.porcentaje_avance);
   document.getElementById('panel-avance-proveedor').innerHTML = `
     ${progressRing({ porcentaje: empresa.porcentaje_avance, tamano: 108, grosor: 10 })}
     <div class="flex-col gap-3">
@@ -2134,6 +2210,7 @@ async function vistaProveedorDocumentos() {
             <option value="CATALOGO_PDF">Catálogo PDF</option><option value="LISTA_PRECIOS">Lista de precios</option><option value="FICHA_TECNICA">Ficha técnica</option>
             <option value="ESPECIFICACIONES">Especificaciones</option><option value="ETIQUETAS">Etiquetas</option><option value="FOTOGRAFIA">Fotografía</option><option value="VIDEO">Video</option><option value="OTRO">Otro</option>
           </select></div>
+        <div class="field hidden" id="campo-otro-tipo"><label class="field__label">Especifica qué tipo de documento es *</label><input class="input" id="input-otro-tipo" placeholder="Ej. Permiso estatal" /></div>
         <div id="dropzone-root"></div>
       </div></div>
     <div class="card"><div class="card__body" id="tabla-documentos"></div></div>`;
@@ -2145,7 +2222,7 @@ async function vistaProveedorDocumentos() {
     contenedor,
     columnas: [
       { clave: 'nombre_archivo', titulo: 'Archivo', render: (f) => `<button class="btn btn--ghost btn--sm" data-ver="${f.id}" style="padding:0; height:auto; font-weight:500;">${escapeHTML(f.nombre_archivo)}</button>` },
-      { clave: 'tipo', titulo: 'Tipo', render: (f) => escapeHTML(formatearEtiqueta(f.tipo)) },
+      { clave: 'tipo', titulo: 'Tipo', render: (f) => escapeHTML(formatearTipoDocumento(f)) },
       { clave: 'tamano_bytes', titulo: 'Tamaño', render: (f) => formatearTamanoArchivo(f.tamano_bytes) },
       { clave: 'creado_en', titulo: 'Subido', render: (f) => formatearFecha(f.creado_en) },
     ], porPagina: 10, textoVacio: 'Aún no has subido documentos.',
@@ -2160,13 +2237,16 @@ async function vistaProveedorDocumentos() {
     contenedor.querySelectorAll('[data-ver]').forEach((btn) => btn.addEventListener('click', () => { const doc = documentos.find((d) => d.id === btn.dataset.ver); abrirVistaPrevia({ bucketId: BUCKETS.DOCUMENTOS, ruta: doc.ruta_storage, nombreArchivo: doc.nombre_archivo, mimeType: doc.mime_type }); }));
   }
   await recargar();
+  wireSelectOtro('input-tipo', 'campo-otro-tipo', 'input-otro-tipo');
 
   crearDropzone({
     contenedor: document.getElementById('dropzone-root'), bucketId: BUCKETS.DOCUMENTOS, multiple: true, accept: '.pdf,.jpg,.jpeg,.png,.webp,.mp4,.mov,.doc,.docx,.xls,.xlsx',
     onArchivosValidos: async (archivos) => {
       if (!empresaId) return toast.error('No tienes una empresa asignada.');
       const tipo = document.getElementById('input-tipo').value;
-      for (const archivo of archivos) { try { await subirDocumento({ empresaId, archivo, tipo }); } catch (err) { toast.error(`${archivo.name}: ${err.message}`); } }
+      const otroDescripcion = document.getElementById('input-otro-tipo').value.trim();
+      if (tipo === 'OTRO' && !otroDescripcion) return toast.error('Especifica qué tipo de documento es.');
+      for (const archivo of archivos) { try { await subirDocumento({ empresaId, archivo, tipo, otroDescripcion }); } catch (err) { toast.error(`${archivo.name}: ${err.message}`); } }
       toast.exito('Documento(s) subido(s) correctamente.'); await recargar();
     },
   });
@@ -2182,16 +2262,17 @@ async function vistaProveedorCertificaciones() {
           <div class="field"><label class="field__label">Certificación</label>
             <select class="select" id="input-tipo">
               <option value="FDA">FDA</option><option value="USDA">USDA</option><option value="CFIA">CFIA</option><option value="HACCP">HACCP</option><option value="SQF">SQF</option><option value="BRCGS">BRCGS</option>
-              <option value="FSSC22000">FSSC 22000</option><option value="ISO22000">ISO 22000</option><option value="KOSHER">Kosher</option><option value="HALAL">Halal</option><option value="ORGANIC">Orgánico</option><option value="NON_GMO">Non-GMO</option>
+              <option value="FSSC22000">FSSC 22000</option><option value="ISO22000">ISO 22000</option><option value="KOSHER">Kosher</option><option value="HALAL">Halal</option><option value="ORGANIC">Orgánico</option><option value="NON_GMO">Non-GMO</option><option value="OTRO">Otro</option>
             </select></div>
           <div class="field"><label class="field__label">Fecha de emisión</label><input class="input" type="date" id="input-emision" /></div>
           <div class="field"><label class="field__label">Fecha de vencimiento</label><input class="input" type="date" id="input-vencimiento" /></div>
         </div>
+        <div class="field hidden" id="campo-otro-tipo"><label class="field__label">Especifica qué certificación es *</label><input class="input" id="input-otro-tipo" placeholder="Ej. Certificado Rainforest Alliance" /></div>
         <div id="dropzone-root"></div>
       </div></div>
     <div class="grid gap-4" style="grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));" id="grid-certificaciones"></div>`;
 
-  const TIPOS_CERTIFICACION = ['FDA', 'USDA', 'CFIA', 'HACCP', 'SQF', 'BRCGS', 'FSSC22000', 'ISO22000', 'KOSHER', 'HALAL', 'ORGANIC', 'NON_GMO'];
+  const TIPOS_CERTIFICACION = ['FDA', 'USDA', 'CFIA', 'HACCP', 'SQF', 'BRCGS', 'FSSC22000', 'ISO22000', 'KOSHER', 'HALAL', 'ORGANIC', 'NON_GMO', 'OTRO'];
   const empresaId = getEmpresaActualId();
   const grid = document.getElementById('grid-certificaciones');
 
@@ -2201,13 +2282,15 @@ async function vistaProveedorCertificaciones() {
     const certificaciones = todos.filter((d) => TIPOS_CERTIFICACION.includes(d.tipo));
     grid.innerHTML = TIPOS_CERTIFICACION.map((tipo) => {
       const doc = certificaciones.find((c) => c.tipo === tipo);
+      const etiquetaTipo = tipo === 'OTRO' ? (doc ? formatearTipoDocumento(doc) : 'Otro') : formatearEtiqueta(tipo);
       return `<div class="card card--interactive" style="cursor:${doc ? 'pointer' : 'default'};" ${doc ? `data-ver="${doc.id}"` : ''}>
-        <div class="card__body flex-col gap-3"><div class="flex justify-between items-start"><span class="font-semibold">${escapeHTML(formatearEtiqueta(tipo))}</span>${doc ? badgeSemaforo(doc.estado) : '<span class="badge badge--gris">No cargado</span>'}</div>
+        <div class="card__body flex-col gap-3"><div class="flex justify-between items-start"><span class="font-semibold">${escapeHTML(etiquetaTipo)}</span>${doc ? badgeSemaforo(doc.estado) : '<span class="badge badge--gris">No cargado</span>'}</div>
         ${doc ? `<span class="text-xs text-tertiary">Vence: ${formatearFecha(doc.fecha_vencimiento)}</span>` : '<span class="text-xs text-tertiary">Sube este documento arriba</span>'}</div></div>`;
     }).join('');
     grid.querySelectorAll('[data-ver]').forEach((card) => card.addEventListener('click', () => { const doc = certificaciones.find((c) => c.id === card.dataset.ver); abrirVistaPrevia({ bucketId: BUCKETS.DOCUMENTOS, ruta: doc.ruta_storage, nombreArchivo: doc.nombre_archivo, mimeType: doc.mime_type }); }));
   }
   await recargar();
+  wireSelectOtro('input-tipo', 'campo-otro-tipo', 'input-otro-tipo');
 
   crearDropzone({
     contenedor: document.getElementById('dropzone-root'), bucketId: BUCKETS.DOCUMENTOS, multiple: false, accept: '.pdf,.jpg,.jpeg,.png,.webp',
@@ -2216,7 +2299,9 @@ async function vistaProveedorCertificaciones() {
       const tipo = document.getElementById('input-tipo').value;
       const fechaEmision = document.getElementById('input-emision').value;
       const fechaVencimiento = document.getElementById('input-vencimiento').value;
-      try { await subirDocumento({ empresaId, archivo, tipo, fechaEmision, fechaVencimiento }); toast.exito('Certificación subida correctamente.'); await recargar(); } catch (err) { toast.error(err.message); }
+      const otroDescripcion = document.getElementById('input-otro-tipo').value.trim();
+      if (tipo === 'OTRO' && !otroDescripcion) return toast.error('Especifica qué certificación es.');
+      try { await subirDocumento({ empresaId, archivo, tipo, fechaEmision, fechaVencimiento, otroDescripcion }); toast.exito('Certificación subida correctamente.'); await recargar(); } catch (err) { toast.error(err.message); }
     },
   });
 }
@@ -2289,7 +2374,8 @@ async function vistaProveedorProductos() {
 async function vistaProveedorPendientes() {
   const contenido = await renderShell('/proveedor/pendientes');
   contenido.innerHTML = `
-    <div class="page-header"><div><div class="page-header__eyebrow">Mi empresa</div><h1>Pendientes</h1></div></div>
+    <div class="page-header"><div><div class="page-header__eyebrow">Mi empresa</div><h1>Pendientes</h1></div>
+      <div class="page-header__actions"><button class="btn btn--primary" id="btn-nuevo-pendiente">+ Nuevo pendiente</button></div></div>
     <div class="chip-group" style="margin-bottom: var(--space-6);" id="filtros-estado">
       <button class="chip" aria-pressed="true" data-estado="">Todos</button><button class="chip" data-estado="pendiente">Pendiente</button>
       <button class="chip" data-estado="en_proceso">En proceso</button><button class="chip" data-estado="en_revision">En revisión</button><button class="chip" data-estado="completado">Completado</button>
@@ -2307,7 +2393,7 @@ async function vistaProveedorPendientes() {
       { clave: 'fecha_limite', titulo: 'Fecha límite', render: (f) => formatearFecha(f.fecha_limite) },
       { clave: 'porcentaje', titulo: 'Avance', render: (f) => `${f.porcentaje}%` },
       { clave: 'estado', titulo: 'Estado', render: (f) => badgeEstadoPendiente(f.estado) },
-    ], porPagina: 10, textoVacio: 'No tienes pendientes en este momento.',
+    ], porPagina: 10, textoVacio: 'No tienes pendientes en este momento. Crea uno con "+ Nuevo pendiente".',
   });
 
   let pendientes = [];
@@ -2324,13 +2410,72 @@ async function vistaProveedorPendientes() {
     chip.setAttribute('aria-pressed', 'true'); filtroEstado = chip.dataset.estado; recargar();
   }));
 
+  document.getElementById('btn-nuevo-pendiente').addEventListener('click', () => {
+    if (!empresaId) return toast.error('No tienes una empresa asignada.');
+    const cuerpoHTML = `
+      <form id="form-pendiente-proveedor" class="flex-col gap-4">
+        <div class="field"><label class="field__label">Título *</label><input class="input" name="titulo" required /></div>
+        <div class="field"><label class="field__label">Descripción</label><textarea class="textarea" name="descripcion"></textarea></div>
+        <div class="grid gap-3" style="grid-template-columns: 1fr 1fr;">
+          <div class="field"><label class="field__label">Nivel de criticidad</label>
+            <select class="select" name="prioridad"><option value="baja">Baja</option><option value="media" selected>Media</option><option value="alta">Alta</option><option value="critica">Crítica</option></select></div>
+          <div class="field"><label class="field__label">Fecha límite</label><input class="input" type="date" name="fecha_limite" /></div>
+        </div>
+      </form>`;
+    abrirModal({
+      titulo: 'Nuevo pendiente', cuerpoHTML,
+      acciones: [
+        { texto: 'Cancelar', variante: 'secondary', onClick: (cerrar) => cerrar() },
+        { texto: 'Crear pendiente', variante: 'primary', onClick: async (cerrar) => {
+          const datos = Object.fromEntries(new FormData(document.getElementById('form-pendiente-proveedor')).entries());
+          if (!esRequerido(datos.titulo)) return toast.error('El título es obligatorio.');
+          try {
+            await crearPendiente({ ...datos, empresa_id: empresaId, fecha_limite: datos.fecha_limite || null });
+            toast.exito('Pendiente creado.'); cerrar(); await recargar();
+          } catch (err) { toast.error(err.message); }
+        } },
+      ],
+    });
+  });
+
   async function abrirDetalle(pendiente) {
     const archivos = await listarArchivosPendiente(pendiente.id);
-    const cuerpoHTML = `<div class="flex-col gap-4"><p class="text-secondary">${escapeHTML(pendiente.descripcion || 'Sin descripción.')}</p>
-      <div class="flex gap-2">${badgePrioridad(pendiente.prioridad)} ${badgeEstadoPendiente(pendiente.estado)}</div>
+    const cuerpoHTML = `<div class="flex-col gap-4">
+      <div class="field"><label class="field__label">Descripción</label><textarea class="textarea" id="edit-descripcion">${escapeHTML(pendiente.descripcion || '')}</textarea></div>
+      <div class="grid gap-3" style="grid-template-columns: 1fr 1fr;">
+        <div class="field"><label class="field__label">Nivel de criticidad</label>
+          <select class="select" id="edit-prioridad">
+            <option value="baja" ${pendiente.prioridad === 'baja' ? 'selected' : ''}>Baja</option>
+            <option value="media" ${pendiente.prioridad === 'media' ? 'selected' : ''}>Media</option>
+            <option value="alta" ${pendiente.prioridad === 'alta' ? 'selected' : ''}>Alta</option>
+            <option value="critica" ${pendiente.prioridad === 'critica' ? 'selected' : ''}>Crítica</option>
+          </select></div>
+        <div class="field"><label class="field__label">Estatus</label>
+          <select class="select" id="edit-estado">
+            <option value="pendiente" ${pendiente.estado === 'pendiente' ? 'selected' : ''}>Pendiente</option>
+            <option value="en_proceso" ${pendiente.estado === 'en_proceso' ? 'selected' : ''}>En proceso</option>
+            <option value="en_revision" ${pendiente.estado === 'en_revision' ? 'selected' : ''}>En revisión</option>
+            <option value="completado" ${pendiente.estado === 'completado' ? 'selected' : ''}>Completado</option>
+          </select></div>
+      </div>
       <div class="flex-col gap-2"><span class="font-medium text-sm">Archivos de soporte</span><div id="lista-archivos-pendiente" class="flex-col gap-2"></div></div>
       <div id="dropzone-pendiente"></div></div>`;
-    abrirModal({ titulo: pendiente.titulo, cuerpoHTML, anchoMax: '560px', acciones: [{ texto: 'Cerrar', variante: 'secondary', onClick: (cerrar) => cerrar() }] });
+
+    const cerrarModal = abrirModal({
+      titulo: pendiente.titulo, cuerpoHTML, anchoMax: '560px',
+      acciones: [
+        { texto: 'Cerrar', variante: 'secondary', onClick: (cerrar) => cerrar() },
+        { texto: 'Guardar cambios', variante: 'primary', onClick: async (cerrar) => {
+          const descripcion = document.getElementById('edit-descripcion').value.trim();
+          const prioridad = document.getElementById('edit-prioridad').value;
+          const estado = document.getElementById('edit-estado').value;
+          try {
+            await actualizarPendiente(pendiente.id, empresaId, { descripcion, prioridad, estado, porcentaje: estado === 'completado' ? 100 : pendiente.porcentaje });
+            toast.exito('Pendiente actualizado.'); cerrar(); await recargar();
+          } catch (err) { toast.error(err.message); }
+        } },
+      ],
+    });
 
     function pintarArchivos(lista) {
       const cont = document.getElementById('lista-archivos-pendiente');
