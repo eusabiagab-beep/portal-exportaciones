@@ -920,6 +920,48 @@ function miniBars(valores = []) {
   return `<div class="mini-bars">${valores.map((v) => `<div class="mini-bars__bar" style="height:${Math.max((v / max) * 100, 4)}%;" title="${v}"></div>`).join('')}</div>`;
 }
 
+/** Busca en empresas/productos/pendientes según el rol. Máx. 5 por categoría. */
+async function buscarGlobal(texto) {
+  const q = texto.trim();
+  if (q.length < 2) return { empresas: [], productos: [], pendientes: [] };
+
+  const resultado = { empresas: [], productos: [], pendientes: [] };
+
+  if (esStaff()) {
+    const { data: empresas } = await supabase.from('empresas').select('id, razon_social').eq('activo', true).ilike('razon_social', `%${q}%`).limit(5);
+    resultado.empresas = (empresas || []).map((e) => ({ titulo: e.razon_social, ruta: `#/admin/empresas?abrir=${e.id}` }));
+
+    const { data: productos } = await supabase.from('productos').select('id, nombre, sku, empresa_id, empresas(razon_social)').eq('activo', true).or(`nombre.ilike.%${q}%,sku.ilike.%${q}%`).limit(5);
+    resultado.productos = (productos || []).map((p) => ({ titulo: `${p.nombre} (${p.empresas?.razon_social || ''})`, ruta: `#/admin/productos?empresa=${p.empresa_id}` }));
+
+    const { data: pendientes } = await supabase.from('pendientes').select('id, titulo, empresa_id, empresas(razon_social)').ilike('titulo', `%${q}%`).limit(5);
+    resultado.pendientes = (pendientes || []).map((p) => ({ titulo: `${p.titulo} (${p.empresas?.razon_social || ''})`, ruta: `#/admin/pendientes?empresa=${p.empresa_id}` }));
+  } else {
+    const empresaId = getEmpresaActualId();
+    if (!empresaId) return resultado;
+    const { data: productos } = await supabase.from('productos').select('id, nombre, sku').eq('empresa_id', empresaId).eq('activo', true).or(`nombre.ilike.%${q}%,sku.ilike.%${q}%`).limit(5);
+    resultado.productos = (productos || []).map((p) => ({ titulo: p.nombre, ruta: '#/proveedor/productos' }));
+
+    const { data: pendientes } = await supabase.from('pendientes').select('id, titulo').eq('empresa_id', empresaId).ilike('titulo', `%${q}%`).limit(5);
+    resultado.pendientes = (pendientes || []).map((p) => ({ titulo: p.titulo, ruta: '#/proveedor/pendientes' }));
+  }
+  return resultado;
+}
+
+function htmlResultadosBusqueda(resultado) {
+  const secciones = [
+    { clave: 'empresas', titulo: 'Empresas' },
+    { clave: 'productos', titulo: 'Productos' },
+    { clave: 'pendientes', titulo: 'Pendientes' },
+  ];
+  const conResultados = secciones.filter((s) => resultado[s.clave]?.length);
+  if (!conResultados.length) return '<div class="empty-state" style="padding:24px;"><p>Sin resultados.</p></div>';
+  return conResultados.map((s) => `
+    <div style="padding: var(--space-2) var(--space-4); font-size: var(--text-xs); font-weight:600; color: var(--color-text-tertiary); text-transform:uppercase;">${s.titulo}</div>
+    ${resultado[s.clave].map((item) => `<a href="${item.ruta}" class="notif-item" style="display:block; cursor:pointer;">${escapeHTML(item.titulo)}</a>`).join('')}
+  `).join('');
+}
+
 /** Chip de etapa del proyecto según % de avance. Nunca muestra "bloqueado". */
 function statusChip(estado) {
   const CONFIG = {
@@ -968,6 +1010,212 @@ function iconCamion() {
     <circle cx="17.5" cy="18.5" r="1.8"/>
     <path d="M1 8h9"/>
   </svg>`;
+}
+
+// --------------------------------------------------------------
+// READINESS POR PAÍS DESTINO — checklist de requisitos
+// --------------------------------------------------------------
+const REQUISITOS_PAIS = {
+  usa: { nombre: 'Estados Unidos', bandera: '🇺🇸', requisitos: ['FDA', 'HACCP'] },
+  canada: { nombre: 'Canadá', bandera: '🇨🇦', requisitos: ['CFIA', 'HACCP'] },
+};
+
+/** Calcula % de cumplimiento por país a partir de los documentos VIGENTES de la empresa. */
+function calcularReadiness(documentos) {
+  const vigentes = new Set((documentos || []).filter((d) => d.estado === 'vigente').map((d) => d.tipo));
+  return Object.entries(REQUISITOS_PAIS).map(([clave, cfg]) => {
+    const cumplidos = cfg.requisitos.filter((r) => vigentes.has(r));
+    const faltantes = cfg.requisitos.filter((r) => !vigentes.has(r));
+    return { clave, ...cfg, cumplidos, faltantes, porcentaje: Math.round((cumplidos.length / cfg.requisitos.length) * 100) };
+  });
+}
+
+/** HTML para usar dentro del portal (usa variables CSS del sistema de diseño). */
+function htmlReadinessPorPais(documentos) {
+  return calcularReadiness(documentos).map((d) => `
+    <div class="flex-col gap-2" style="padding: var(--space-3) 0; border-bottom: 1px solid var(--color-border);">
+      <div class="flex justify-between items-center">
+        <span class="font-medium text-sm">${d.bandera} ${d.nombre}</span>
+        <span class="text-sm font-semibold">${d.porcentaje}%</span>
+      </div>
+      ${d.faltantes.length
+        ? `<span class="text-xs text-tertiary">Falta: ${d.faltantes.map(formatearEtiqueta).join(', ')}</span>`
+        : '<span class="text-xs" style="color:var(--color-success);">Todos los requisitos vigentes</span>'}
+    </div>`).join('');
+}
+
+/** Versión en HTML plano (sin variables CSS) para el expediente imprimible. */
+function htmlReadinessPlano(documentos) {
+  return calcularReadiness(documentos).map((d) =>
+    `<p><strong>${d.bandera} ${d.nombre}:</strong> ${d.porcentaje}% ${d.faltantes.length ? '— Falta: ' + d.faltantes.map(formatearEtiqueta).join(', ') : '— Todos los requisitos vigentes'}</p>`
+  ).join('');
+}
+
+// --------------------------------------------------------------
+// EXPEDIENTE DE CUMPLIMIENTO — vista imprimible (Guardar como PDF
+// desde el diálogo de impresión del navegador; no requiere
+// librerías adicionales).
+// --------------------------------------------------------------
+function generarExpediente({ empresa, documentos, productos }) {
+  const ventana = window.open('', '_blank');
+  if (!ventana) { toast.error('Tu navegador bloqueó la ventana emergente. Habilítala e intenta de nuevo.'); return; }
+
+  const filasDocs = (documentos || []).map((d) => `<tr><td>${formatearTipoDocumento(d)}</td><td>${formatearEtiqueta(d.estado)}</td><td>${formatearFecha(d.fecha_vencimiento)}</td></tr>`).join('');
+  const filasProd = (productos || []).map((p) => `<tr><td>${p.nombre}</td><td>${p.sku}</td><td>${formatearMoneda(p.precio, p.moneda)}</td></tr>`).join('');
+
+  ventana.document.write(`
+    <html><head><title>Expediente — ${empresa.razon_social}</title>
+    <meta charset="UTF-8" />
+    <style>
+      body { font-family: Arial, Helvetica, sans-serif; padding: 48px; color: #10151F; max-width: 780px; margin: 0 auto; }
+      h1 { font-size: 24px; margin-bottom: 4px; }
+      h2 { font-size: 15px; margin-top: 28px; border-bottom: 2px solid #2A4A73; padding-bottom: 6px; color: #2A4A73; }
+      table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+      td, th { padding: 7px 8px; border-bottom: 1px solid #E7E9EE; text-align: left; font-size: 13px; }
+      th { background: #F0F2F5; }
+      .meta { color: #5B6472; font-size: 13px; margin-bottom: 16px; }
+      @media print { body { padding: 24px; } }
+    </style></head><body>
+    <h1>Expediente de Cumplimiento para Exportación</h1>
+    <p class="meta">${empresa.razon_social}${empresa.nombre_comercial ? ' (' + empresa.nombre_comercial + ')' : ''} — generado el ${formatearFecha(new Date())}</p>
+    <h2>Preparación por país destino</h2>
+    ${htmlReadinessPlano(documentos)}
+    <h2>Certificaciones y documentos</h2>
+    <table><tr><th>Documento</th><th>Estado</th><th>Vence</th></tr>${filasDocs || '<tr><td colspan="3">Sin documentos cargados.</td></tr>'}</table>
+    <h2>Catálogo de productos</h2>
+    <table><tr><th>Producto</th><th>SKU</th><th>Precio</th></tr>${filasProd || '<tr><td colspan="3">Sin productos cargados.</td></tr>'}</table>
+    <script>window.onload = () => window.print();<\/script>
+    </body></html>`);
+  ventana.document.close();
+}
+
+// --------------------------------------------------------------
+// ONBOARDING DEL PROVEEDOR — checklist de primeros pasos
+// Pensado para completarse en menos de 10 minutos. Se oculta
+// permanentemente cuando el proveedor marca "completado", o solo
+// por esta sesión con el botón de cerrar (✕).
+// --------------------------------------------------------------
+function pintarOnboarding(contenedor, empresa, conteos) {
+  if (!contenedor || empresa.onboarding_completado) { if (contenedor) contenedor.innerHTML = ''; return; }
+
+  const pasos = [
+    { texto: 'Confirma los datos de contacto de tu empresa', hecho: !!empresa.email_contacto, ruta: '#/proveedor/perfil' },
+    { texto: 'Sube al menos una certificación (FDA, HACCP, etc.)', hecho: conteos.documentos > 0, ruta: '#/proveedor/certificaciones' },
+    { texto: 'Agrega tu primer producto al catálogo', hecho: conteos.productos > 0, ruta: '#/proveedor/productos' },
+    { texto: 'Revisa tus pendientes y escribe un comentario si tienes dudas', hecho: false, ruta: '#/proveedor/pendientes' },
+  ];
+
+  contenedor.innerHTML = `
+    <div class="card" style="margin-bottom: var(--space-6); border-color: var(--color-accent);">
+      <div class="card__body flex-col gap-4">
+        <div class="flex justify-between items-start">
+          <div><h3>👋 Primeros pasos</h3><p class="text-sm text-secondary">Te toma menos de 10 minutos dejar tu perfil listo para revisión.</p></div>
+          <button class="btn btn--ghost btn--sm" id="btn-cerrar-onboarding" aria-label="Cerrar">✕</button>
+        </div>
+        <div class="flex-col gap-2">
+          ${pasos.map((p) => `
+            <a href="${p.ruta}" class="flex items-center gap-3 text-sm" style="text-decoration:none;">
+              <span style="width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;flex-shrink:0;background:${p.hecho ? 'var(--color-success-subtle)' : 'var(--color-bg-subtle)'};color:${p.hecho ? 'var(--color-success)' : 'var(--color-text-tertiary)'};font-size:12px;">${p.hecho ? '✓' : ''}</span>
+              <span style="color:${p.hecho ? 'var(--color-text-tertiary)' : 'var(--color-text-primary)'};${p.hecho ? 'text-decoration:line-through;' : ''}">${escapeHTML(p.texto)}</span>
+            </a>`).join('')}
+        </div>
+        <button class="btn btn--secondary btn--sm" id="btn-completar-onboarding" style="align-self:flex-start;">Marcar como completado</button>
+      </div>
+    </div>`;
+
+  contenedor.querySelector('#btn-cerrar-onboarding').addEventListener('click', () => { contenedor.innerHTML = ''; });
+  contenedor.querySelector('#btn-completar-onboarding').addEventListener('click', async () => {
+    try {
+      await actualizarEmpresa(empresa.id, { onboarding_completado: true });
+      toast.exito('¡Listo! Bienvenido al portal.');
+      contenedor.innerHTML = '';
+    } catch (err) { toast.error(err.message); }
+  });
+}
+
+// --------------------------------------------------------------
+// HISTORIAL DE VERSIONES DE DOCUMENTOS — modal reutilizable
+// --------------------------------------------------------------
+async function abrirModalVersiones(documento, empresaId, onActualizado) {
+  const versiones = await listarVersiones(documento.id);
+  const cuerpoHTML = `
+    <div class="flex-col gap-4">
+      <div class="flex-col gap-2">
+        <span class="font-medium text-sm">Versión actual: v${documento.version_actual || 1}</span>
+        <div id="lista-versiones" class="flex-col gap-2"></div>
+      </div>
+      <div class="flex-col gap-2">
+        <span class="font-medium text-sm">Subir nueva versión (reemplaza el archivo activo)</span>
+        <div id="dropzone-version"></div>
+      </div>
+    </div>`;
+  abrirModal({ titulo: `Versiones — ${documento.nombre_archivo}`, cuerpoHTML, anchoMax: '600px', acciones: [{ texto: 'Cerrar', variante: 'secondary', onClick: (cerrar) => cerrar() }] });
+
+  function pintarVersiones() {
+    const cont = document.getElementById('lista-versiones');
+    if (!versiones.length) { cont.innerHTML = '<span class="text-xs text-tertiary">Esta es la primera versión, aún no hay historial.</span>'; return; }
+    cont.innerHTML = versiones.map((v) => `
+      <button class="btn btn--secondary btn--sm" data-ver-version="${v.ruta_storage}" data-mime="application/pdf" style="justify-content:space-between;">
+        <span>v${v.numero_version} — ${escapeHTML(v.usuarios?.nombre_completo || '')}</span>
+        <span class="text-tertiary">${formatearFechaHora(v.creado_en)}</span>
+      </button>`).join('');
+    cont.querySelectorAll('[data-ver-version]').forEach((btn) => btn.addEventListener('click', () => abrirVistaPrevia({ bucketId: BUCKETS.DOCUMENTOS, ruta: btn.dataset.verVersion, nombreArchivo: documento.nombre_archivo, mimeType: btn.dataset.mime })));
+  }
+  pintarVersiones();
+
+  crearDropzone({
+    contenedor: document.getElementById('dropzone-version'), bucketId: BUCKETS.DOCUMENTOS, multiple: false,
+    onArchivosValidos: async ([archivo]) => {
+      try {
+        await subirNuevaVersion({ documentoId: documento.id, empresaId, archivo });
+        toast.exito('Nueva versión subida correctamente.');
+        cerrarModalActivo();
+        await onActualizado?.();
+      } catch (err) { toast.error(err.message); }
+    },
+  });
+}
+
+// --------------------------------------------------------------
+// CALCULADOR DE COSTEO DE EXPORTACIÓN (landed cost)
+// Cálculo en vivo, no persiste en base de datos — el usuario
+// ingresa los supuestos cada vez (flete, arancel, margen deseado).
+// --------------------------------------------------------------
+function abrirCalculadoraCosteo(producto) {
+  const cuerpoHTML = `
+    <div class="flex-col gap-4">
+      <p class="text-sm text-secondary">Precio FOB actual: <strong>${formatearMoneda(producto.precio, producto.moneda)}</strong> por ${escapeHTML(producto.presentacion || 'unidad')}.</p>
+      <div class="grid gap-3" style="grid-template-columns: 1fr 1fr;">
+        <div class="field"><label class="field__label">Flete estimado (por unidad)</label><input class="input" type="number" step="0.01" id="calc-flete" value="0" /></div>
+        <div class="field"><label class="field__label">Arancel (%)</label><input class="input" type="number" step="0.1" id="calc-arancel" value="0" /></div>
+      </div>
+      <div class="field"><label class="field__label">Margen deseado sobre el landed cost (%)</label><input class="input" type="number" step="0.1" id="calc-margen" value="20" /></div>
+      <div class="card" style="background: var(--color-bg-subtle); border:none;">
+        <div class="card__body flex-col gap-2" id="calc-resultado"></div>
+      </div>
+    </div>`;
+
+  const cerrarModal = abrirModal({ titulo: `Costeo de exportación — ${producto.nombre}`, cuerpoHTML, anchoMax: '520px', acciones: [{ texto: 'Cerrar', variante: 'secondary', onClick: (cerrar) => cerrar() }] });
+
+  function recalcular() {
+    const precioFOB = Number(producto.precio) || 0;
+    const flete = Number(document.getElementById('calc-flete').value) || 0;
+    const arancelPct = Number(document.getElementById('calc-arancel').value) || 0;
+    const margenPct = Number(document.getElementById('calc-margen').value) || 0;
+
+    const arancelMonto = precioFOB * (arancelPct / 100);
+    const landedCost = precioFOB + flete + arancelMonto;
+    const precioSugerido = landedCost * (1 + margenPct / 100);
+
+    document.getElementById('calc-resultado').innerHTML = `
+      <div class="flex justify-between text-sm"><span class="text-secondary">Precio FOB</span><span>${formatearMoneda(precioFOB, producto.moneda)}</span></div>
+      <div class="flex justify-between text-sm"><span class="text-secondary">+ Flete</span><span>${formatearMoneda(flete, producto.moneda)}</span></div>
+      <div class="flex justify-between text-sm"><span class="text-secondary">+ Arancel (${arancelPct}%)</span><span>${formatearMoneda(arancelMonto, producto.moneda)}</span></div>
+      <div class="flex justify-between font-semibold" style="border-top:1px solid var(--color-border); padding-top:8px;"><span>Landed cost</span><span>${formatearMoneda(landedCost, producto.moneda)}</span></div>
+      <div class="flex justify-between font-semibold" style="color:var(--color-primary);"><span>Precio sugerido de venta (+${margenPct}%)</span><span>${formatearMoneda(precioSugerido, producto.moneda)}</span></div>`;
+  }
+  ['calc-flete', 'calc-arancel', 'calc-margen'].forEach((id) => document.getElementById(id).addEventListener('input', recalcular));
+  recalcular();
 }
 
 // --------------------------------------------------------------
@@ -1110,6 +1358,37 @@ async function eliminarDocumento(documentoId, empresaId) {
   const { error } = await supabase.from('documentos').update({ activo: false }).eq('id', documentoId);
   if (error) throw new Error(mensajeErrorSupabase(error));
   await registrarHistorial({ empresaId, accion: 'documento_eliminado', entidadTipo: 'documento', entidadId: documentoId });
+}
+
+/** Sube una nueva versión de un documento existente, conservando el historial de versiones anteriores. */
+async function subirNuevaVersion({ documentoId, empresaId, archivo, notaCambio }) {
+  const usuario = getUsuarioActual();
+  const ruta = construirRutaStorage(empresaId, archivo.name);
+  const { error: uploadError } = await supabase.storage.from(BUCKETS.DOCUMENTOS).upload(ruta, archivo);
+  if (uploadError) throw new Error(mensajeErrorSupabase(uploadError));
+
+  const { data: docActual, error: errDoc } = await supabase.from('documentos').select('version_actual').eq('id', documentoId).single();
+  if (errDoc) throw new Error(mensajeErrorSupabase(errDoc));
+  const nuevaVersion = (docActual.version_actual || 1) + 1;
+
+  const { error: errVersion } = await supabase.from('documento_versiones').insert({
+    documento_id: documentoId, numero_version: nuevaVersion, ruta_storage: ruta, tamano_bytes: archivo.size, subido_por: usuario.id, nota_cambio: notaCambio || null,
+  });
+  if (errVersion) throw new Error(mensajeErrorSupabase(errVersion));
+
+  const { data, error } = await supabase.from('documentos').update({
+    ruta_storage: ruta, nombre_archivo: archivo.name, mime_type: archivo.type, tamano_bytes: archivo.size, version_actual: nuevaVersion,
+  }).eq('id', documentoId).select().single();
+  if (error) throw new Error(mensajeErrorSupabase(error));
+
+  await registrarHistorial({ empresaId, accion: 'documento_actualizado', entidadTipo: 'documento', entidadId: documentoId, detalle: { version: nuevaVersion } });
+  return data;
+}
+
+async function listarVersiones(documentoId) {
+  const { data, error } = await supabase.from('documento_versiones').select('*, usuarios(nombre_completo)').eq('documento_id', documentoId).order('numero_version', { ascending: false });
+  if (error) throw new Error(mensajeErrorSupabase(error));
+  return data;
 }
 async function listarCertificacionesPorVencer({ empresaId, dias = 30 } = {}) {
   const limite = new Date(); limite.setDate(limite.getDate() + dias);
@@ -1284,7 +1563,12 @@ async function htmlTopbar() {
     <header class="topbar">
       <div class="flex items-center gap-4">
         <button class="btn btn--icon btn--ghost" data-toggle-sidebar aria-label="Alternar menú">☰</button>
-        <label class="topbar__search"><span aria-hidden="true">🔍</span><input type="search" placeholder="Buscar…" aria-label="Búsqueda global" /></label>
+        <div style="position:relative;">
+          <label class="topbar__search">
+            <span aria-hidden="true">🔍</span><input type="search" id="input-busqueda-global" placeholder="Buscar empresas, productos, pendientes…" aria-label="Búsqueda global" />
+          </label>
+          <div class="notif-panel hidden" id="panel-busqueda" style="left:0; top: calc(100% + var(--space-2));"></div>
+        </div>
       </div>
       <div class="topbar__actions">
         <button class="btn btn--icon btn--ghost" data-toggle-tema aria-label="Alternar tema">🌓</button>
@@ -1308,7 +1592,24 @@ function activarEventosTopbar(root) {
   const botonNotif = root.querySelector('[data-toggle-notif]');
   const panelNotif = root.querySelector('[data-panel-notif]');
   botonNotif?.addEventListener('click', async () => { const oculto = panelNotif.classList.contains('hidden'); if (oculto) await pintarNotificacionesPanel(panelNotif); panelNotif.classList.toggle('hidden'); });
-  document.addEventListener('click', (e) => { if (!root.contains(e.target)) panelNotif?.classList.add('hidden'); });
+
+  const inputBusqueda = root.querySelector('#input-busqueda-global');
+  const panelBusqueda = root.querySelector('#panel-busqueda');
+  let debounceBusqueda;
+  inputBusqueda?.addEventListener('input', (e) => {
+    window.clearTimeout(debounceBusqueda);
+    const texto = e.target.value;
+    debounceBusqueda = window.setTimeout(async () => {
+      if (texto.trim().length < 2) { panelBusqueda.classList.add('hidden'); return; }
+      const resultado = await buscarGlobal(texto);
+      panelBusqueda.innerHTML = htmlResultadosBusqueda(resultado);
+      panelBusqueda.classList.remove('hidden');
+    }, 300);
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!root.contains(e.target)) { panelNotif?.classList.add('hidden'); panelBusqueda?.classList.add('hidden'); }
+  });
 }
 
 /** Renderiza el shell (sidebar+topbar) + retorna el contenedor de contenido para que la vista lo llene */
@@ -1465,6 +1766,9 @@ async function vistaRegistro() {
   selectRol.addEventListener('change', actualizarVisibilidadEmpresa);
   actualizarVisibilidadEmpresa();
 
+  const empresaPreseleccionada = getRutaQuery().get('empresa');
+  if (empresaPreseleccionada) { selectRol.value = 'proveedor'; selectEmpresa.value = empresaPreseleccionada; actualizarVisibilidadEmpresa(); }
+
   document.getElementById('form-registro').addEventListener('submit', async (e) => {
     e.preventDefault();
     const nombre = document.getElementById('nombre').value.trim();
@@ -1596,10 +1900,26 @@ async function vistaAdminEmpresas() {
     const empresas = await listarEmpresas();
     tabla.setDatos(empresas);
     tablaContenedor.querySelectorAll('[data-editar]').forEach((btn) => btn.addEventListener('click', () => abrirModalEmpresa(empresas.find((e) => e.id === btn.dataset.editar))));
+    const idAbrir = getRutaQuery().get('abrir');
+    if (idAbrir) { const encontrada = empresas.find((e) => e.id === idAbrir); if (encontrada) abrirModalEmpresa(encontrada); }
   }
   await recargar();
 
-  function abrirModalEmpresa(empresaExistente = null) {
+  async function abrirModalEmpresa(empresaExistente = null) {
+    let usuariosEmpresa = [];
+    let documentosEmpresa = [];
+    let productosEmpresa = [];
+    if (empresaExistente) {
+      const [{ data: ue }, docs, prods] = await Promise.all([
+        supabase.from('usuarios_empresas').select('usuarios(id, nombre_completo, email)').eq('empresa_id', empresaExistente.id),
+        listarDocumentosEmpresa(empresaExistente.id),
+        listarProductosEmpresa(empresaExistente.id),
+      ]);
+      usuariosEmpresa = (ue || []).map((r) => r.usuarios).filter(Boolean);
+      documentosEmpresa = docs;
+      productosEmpresa = prods;
+    }
+
     const cuerpoHTML = `
       <form id="form-empresa" class="flex-col gap-4">
         <div class="field"><label class="field__label">Razón social *</label><input class="input" name="razon_social" value="${escapeHTML(empresaExistente?.razon_social || '')}" required /></div>
@@ -1614,8 +1934,25 @@ async function vistaAdminEmpresas() {
         </div>
         <div class="field"><label class="field__label">Correo de contacto</label><input class="input" type="email" name="email_contacto" value="${escapeHTML(empresaExistente?.email_contacto || '')}" /></div>
         <div class="field"><label class="field__label">Descripción</label><textarea class="textarea" name="descripcion">${escapeHTML(empresaExistente?.descripcion || '')}</textarea></div>
-      </form>`;
+      </form>
+      ${empresaExistente ? `
+        <div style="margin-top: var(--space-6); border-top: 1px solid var(--color-border); padding-top: var(--space-5);">
+          <h4 style="margin-bottom: var(--space-3);">Preparación por país destino</h4>
+          ${htmlReadinessPorPais(documentosEmpresa)}
+        </div>
+        <div style="margin-top: var(--space-5); border-top: 1px solid var(--color-border); padding-top: var(--space-5);">
+          <div class="flex justify-between items-center" style="margin-bottom: var(--space-3);">
+            <h4>Usuarios con acceso (${usuariosEmpresa.length})</h4>
+            <a href="#/registro?empresa=${empresaExistente.id}" class="btn btn--secondary btn--sm">+ Agregar usuario</a>
+          </div>
+          ${usuariosEmpresa.length ? usuariosEmpresa.map((u) => `<div class="flex justify-between text-sm" style="padding: var(--space-2) 0;"><span>${escapeHTML(u.nombre_completo)}</span><span class="text-tertiary">${escapeHTML(u.email)}</span></div>`).join('') : '<p class="text-sm text-tertiary">Sin usuarios asignados todavía.</p>'}
+        </div>
+      ` : ''}
+    `;
     const acciones = [{ texto: 'Cancelar', variante: 'secondary', onClick: (cerrar) => cerrar() }];
+    if (empresaExistente) {
+      acciones.push({ texto: 'Generar expediente', variante: 'secondary', onClick: () => generarExpediente({ empresa: empresaExistente, documentos: documentosEmpresa, productos: productosEmpresa }) });
+    }
     if (esAdmin()) {
       acciones.push({
         texto: empresaExistente ? 'Guardar cambios' : 'Crear empresa', variante: 'primary',
@@ -1637,7 +1974,7 @@ async function vistaAdminEmpresas() {
         });
       }
     }
-    abrirModal({ titulo: empresaExistente ? 'Editar empresa' : 'Nueva empresa', cuerpoHTML, acciones, anchoMax: '620px' });
+    abrirModal({ titulo: empresaExistente ? 'Editar empresa' : 'Nueva empresa', cuerpoHTML, acciones, anchoMax: '680px' });
   }
   document.getElementById('btn-nueva-empresa').addEventListener('click', () => abrirModalEmpresa());
 }
@@ -1697,6 +2034,8 @@ async function vistaAdminPendientes() {
   const usuariosStaff = (await listarUsuarios()).filter((u) => u.rol !== 'proveedor');
   const selectEmpresa = document.getElementById('filtro-empresa');
   selectEmpresa.innerHTML = empresas.map((e) => `<option value="${e.id}">${escapeHTML(e.razon_social)}</option>`).join('');
+  const empresaPreseleccionada = getRutaQuery().get('empresa');
+  if (empresaPreseleccionada) selectEmpresa.value = empresaPreseleccionada;
 
   let filtroEstado = '';
   const contenedor = document.getElementById('tabla-pendientes');
@@ -1835,6 +2174,8 @@ async function vistaAdminDocumentos() {
   const empresas = await listarEmpresas();
   const selectEmpresa = document.getElementById('filtro-empresa');
   selectEmpresa.innerHTML = empresas.map((e) => `<option value="${e.id}">${escapeHTML(e.razon_social)}</option>`).join('');
+  const empresaPreseleccionada = getRutaQuery().get('empresa');
+  if (empresaPreseleccionada) selectEmpresa.value = empresaPreseleccionada;
 
   const contenedor = document.getElementById('tabla-documentos');
   const tabla = crearTabla({
@@ -1845,7 +2186,7 @@ async function vistaAdminDocumentos() {
       { clave: 'tamano_bytes', titulo: 'Tamaño', render: (f) => formatearTamanoArchivo(f.tamano_bytes) },
       { clave: 'fecha_vencimiento', titulo: 'Vence', render: (f) => formatearFecha(f.fecha_vencimiento) },
       { clave: 'estado', titulo: 'Estado', render: (f) => badgeSemaforo(f.estado) },
-      { clave: 'acciones', titulo: '', render: (f) => esAdmin() ? `<button class="btn btn--sm btn--danger" data-eliminar="${f.id}">Eliminar</button>` : '' },
+      { clave: 'acciones', titulo: '', render: (f) => `<div class="flex gap-2">${f.version_actual > 1 ? '' : ''}<button class="btn btn--sm btn--secondary" data-versiones="${f.id}">Versiones</button>${esAdmin() ? `<button class="btn btn--sm btn--danger" data-eliminar="${f.id}">Eliminar</button>` : ''}</div>` },
     ], porPagina: 10, textoVacio: 'Esta empresa no tiene documentos cargados.',
   });
 
@@ -1857,6 +2198,7 @@ async function vistaAdminDocumentos() {
     tabla.setDatos(documentosActuales);
     contenedor.querySelectorAll('[data-ver]').forEach((btn) => btn.addEventListener('click', () => { const doc = documentosActuales.find((d) => d.id === btn.dataset.ver); abrirVistaPrevia({ bucketId: BUCKETS.DOCUMENTOS, ruta: doc.ruta_storage, nombreArchivo: doc.nombre_archivo, mimeType: doc.mime_type }); }));
     contenedor.querySelectorAll('[data-eliminar]').forEach((btn) => btn.addEventListener('click', () => confirmarAccion({ titulo: 'Eliminar documento', mensaje: '¿Seguro que deseas eliminar este documento?', textoConfirmar: 'Eliminar', onConfirmar: async () => { await eliminarDocumento(btn.dataset.eliminar, empresaId); toast.exito('Documento eliminado.'); await recargar(); } })));
+    contenedor.querySelectorAll('[data-versiones]').forEach((btn) => btn.addEventListener('click', () => { const doc = documentosActuales.find((d) => d.id === btn.dataset.versiones); abrirModalVersiones(doc, empresaId, recargar); }));
   }
   selectEmpresa.addEventListener('change', recargar);
   if (empresas.length) await recargar();
@@ -1892,6 +2234,8 @@ async function vistaAdminProductos() {
   const empresas = await listarEmpresas();
   const selectEmpresa = document.getElementById('filtro-empresa');
   selectEmpresa.innerHTML = empresas.map((e) => `<option value="${e.id}">${escapeHTML(e.razon_social)}</option>`).join('');
+  const empresaPreseleccionada = getRutaQuery().get('empresa');
+  if (empresaPreseleccionada) selectEmpresa.value = empresaPreseleccionada;
 
   const contenedor = document.getElementById('tabla-productos');
   const tabla = crearTabla({
@@ -1901,7 +2245,7 @@ async function vistaAdminProductos() {
       { clave: 'sku', titulo: 'SKU', render: (f) => `<span class="mono">${escapeHTML(f.sku)}</span>` },
       { clave: 'presentacion', titulo: 'Presentación', render: (f) => escapeHTML(f.presentacion || '—') },
       { clave: 'precio', titulo: 'Precio', ordenable: true, render: (f) => formatearMoneda(f.precio, f.moneda) },
-      { clave: 'acciones', titulo: '', render: (f) => esAdmin() ? `<button class="btn btn--sm btn--secondary" data-editar="${f.id}">Editar</button>` : '' },
+      { clave: 'acciones', titulo: '', render: (f) => `<div class="flex gap-2"><button class="btn btn--sm btn--secondary" data-costeo="${f.id}">Costeo</button>${esAdmin() ? `<button class="btn btn--sm btn--secondary" data-editar="${f.id}">Editar</button>` : ''}</div>` },
     ], porPagina: 10, textoVacio: 'Esta empresa aún no tiene productos en catálogo.',
   });
 
@@ -1912,6 +2256,7 @@ async function vistaAdminProductos() {
     productosActuales = await listarProductosEmpresa(empresaId);
     tabla.setDatos(productosActuales);
     contenedor.querySelectorAll('[data-editar]').forEach((btn) => btn.addEventListener('click', () => abrirModalProducto(productosActuales.find((p) => p.id === btn.dataset.editar))));
+    contenedor.querySelectorAll('[data-costeo]').forEach((btn) => btn.addEventListener('click', () => abrirCalculadoraCosteo(productosActuales.find((p) => p.id === btn.dataset.costeo))));
   }
   selectEmpresa.addEventListener('change', recargar);
   if (empresas.length) await recargar();
@@ -1974,6 +2319,8 @@ async function vistaAdminComentarios() {
   const empresas = await listarEmpresas();
   const selectEmpresa = document.getElementById('filtro-empresa');
   selectEmpresa.innerHTML = empresas.map((e) => `<option value="${e.id}">${escapeHTML(e.razon_social)}</option>`).join('');
+  const empresaPreseleccionada = getRutaQuery().get('empresa');
+  if (empresaPreseleccionada) selectEmpresa.value = empresaPreseleccionada;
 
   const hilo = document.getElementById('hilo-comentarios');
   let cancelarSuscripcion = null;
@@ -2083,10 +2430,13 @@ async function vistaProveedorDashboard() {
   const contenido = await renderShell('/proveedor/dashboard');
   contenido.innerHTML = `
     <div class="breadcrumb"><span>Mi empresa</span><span class="breadcrumb__sep">/</span><span class="breadcrumb__current">Dashboard</span></div>
-    <div class="page-header"><div><div class="page-header__eyebrow">Mi empresa</div><h1 id="titulo-empresa">Dashboard</h1></div></div>
-    <div class="grid gap-4" style="grid-template-columns: 1.2fr 2fr; margin-bottom: var(--space-8);">
+    <div class="page-header"><div><div class="page-header__eyebrow">Mi empresa</div><h1 id="titulo-empresa">Dashboard</h1></div>
+      <div class="page-header__actions"><button class="btn btn--secondary" id="btn-expediente">Descargar expediente</button></div></div>
+    <div id="banner-onboarding"></div>
+    <div class="grid gap-4" style="grid-template-columns: 1.2fr 1fr 1fr; margin-bottom: var(--space-8);">
       <div class="card"><div class="card__body flex items-center gap-6" id="panel-avance-proveedor">${skeletonLineas(2)}</div></div>
-      <div class="grid gap-4" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));" id="kpis-root">
+      <div class="card"><div class="card__header"><h3>Preparación por país</h3></div><div class="card__body" id="panel-readiness">${skeletonLineas(2)}</div></div>
+      <div class="grid gap-4" id="kpis-root">
         ${Array.from({ length: 2 }).map(() => `<div class="card kpi-card">${skeletonLineas(2)}</div>`).join('')}
       </div>
     </div>
@@ -2103,13 +2453,19 @@ async function vistaProveedorDashboard() {
   const empresa = await obtenerEmpresa(empresaId);
   document.getElementById('titulo-empresa').textContent = empresa.nombre_comercial || empresa.razon_social;
 
-  const pendientes = await listarPendientesEmpresa(empresaId);
+  const [pendientes, certificaciones, documentosEmpresa, productosEmpresa] = await Promise.all([
+    listarPendientesEmpresa(empresaId),
+    listarCertificacionesPorVencer({ empresaId, dias: 30 }),
+    listarDocumentosEmpresa(empresaId),
+    listarProductosEmpresa(empresaId),
+  ]);
   const pendientesAbiertos = pendientes.filter((p) => !['completado', 'cancelado'].includes(p.estado));
-  const certificaciones = await listarCertificacionesPorVencer({ empresaId, dias: 30 });
+
+  pintarOnboarding(document.getElementById('banner-onboarding'), empresa, { productos: productosEmpresa.length, documentos: documentosEmpresa.length });
 
   const estadoEtapa = etapaPorAvance(empresa.porcentaje_avance);
   document.getElementById('panel-avance-proveedor').innerHTML = `
-    ${progressRing({ porcentaje: empresa.porcentaje_avance, tamano: 108, grosor: 10 })}
+    ${progressRing({ porcentaje: empresa.porcentaje_avance, tamano: 96, grosor: 9 })}
     <div class="flex-col gap-3">
       <span class="text-xs text-tertiary" style="text-transform:uppercase; letter-spacing: var(--letter-spacing-wide); font-weight:600;">Etapa del proyecto</span>
       ${statusChip(estadoEtapa)}
@@ -2117,11 +2473,15 @@ async function vistaProveedorDashboard() {
     </div>`;
   activarProgressRings(document.getElementById('panel-avance-proveedor'));
 
+  document.getElementById('panel-readiness').innerHTML = htmlReadinessPorPais(documentosEmpresa);
+
   document.getElementById('kpis-root').innerHTML = [
     kpiCard({ etiqueta: 'Pendientes abiertos', valor: pendientesAbiertos.length }),
     kpiCard({ etiqueta: 'Certificaciones por vencer', valor: certificaciones.length, delta: certificaciones.length > 0 ? { valor: 'Revisar pronto', direccion: 'down' } : undefined }),
   ].join('');
   document.querySelectorAll('#kpis-root .kpi-card__value').forEach((el) => { const v = parseInt(el.textContent, 10); if (!Number.isNaN(v)) animarContador(el, v); });
+
+  document.getElementById('btn-expediente').addEventListener('click', () => generarExpediente({ empresa, documentos: documentosEmpresa, productos: productosEmpresa }));
 
   crearTabla({
     contenedor: document.getElementById('tabla-pendientes'),
@@ -2135,12 +2495,13 @@ async function vistaProveedorDashboard() {
   crearTabla({
     contenedor: document.getElementById('tabla-certificaciones'),
     columnas: [
-      { clave: 'tipo', titulo: 'Documento', render: (f) => escapeHTML(formatearEtiqueta(f.tipo)) },
+      { clave: 'tipo', titulo: 'Documento', render: (f) => escapeHTML(formatearTipoDocumento(f)) },
       { clave: 'fecha_vencimiento', titulo: 'Vence', render: (f) => formatearFecha(f.fecha_vencimiento) },
       { clave: 'estado', titulo: 'Estado', render: (f) => badgeSemaforo(f.estado) },
     ], porPagina: 6, textoVacio: 'Ninguna certificación vence pronto.',
   }).setDatos(certificaciones);
 }
+
 
 async function vistaProveedorPerfil(usuario) {
   const contenido = await renderShell('/proveedor/perfil');
@@ -2225,6 +2586,7 @@ async function vistaProveedorDocumentos() {
       { clave: 'tipo', titulo: 'Tipo', render: (f) => escapeHTML(formatearTipoDocumento(f)) },
       { clave: 'tamano_bytes', titulo: 'Tamaño', render: (f) => formatearTamanoArchivo(f.tamano_bytes) },
       { clave: 'creado_en', titulo: 'Subido', render: (f) => formatearFecha(f.creado_en) },
+      { clave: 'acciones', titulo: '', render: (f) => `<button class="btn btn--sm btn--secondary" data-versiones="${f.id}">Versiones</button>` },
     ], porPagina: 10, textoVacio: 'Aún no has subido documentos.',
   });
 
@@ -2235,6 +2597,7 @@ async function vistaProveedorDocumentos() {
     documentos = todos.filter((d) => TIPOS_NO_CERTIFICACION.includes(d.tipo));
     tabla.setDatos(documentos);
     contenedor.querySelectorAll('[data-ver]').forEach((btn) => btn.addEventListener('click', () => { const doc = documentos.find((d) => d.id === btn.dataset.ver); abrirVistaPrevia({ bucketId: BUCKETS.DOCUMENTOS, ruta: doc.ruta_storage, nombreArchivo: doc.nombre_archivo, mimeType: doc.mime_type }); }));
+    contenedor.querySelectorAll('[data-versiones]').forEach((btn) => btn.addEventListener('click', () => { const doc = documentos.find((d) => d.id === btn.dataset.versiones); abrirModalVersiones(doc, empresaId, recargar); }));
   }
   await recargar();
   wireSelectOtro('input-tipo', 'campo-otro-tipo', 'input-otro-tipo');
@@ -2285,9 +2648,10 @@ async function vistaProveedorCertificaciones() {
       const etiquetaTipo = tipo === 'OTRO' ? (doc ? formatearTipoDocumento(doc) : 'Otro') : formatearEtiqueta(tipo);
       return `<div class="card card--interactive" style="cursor:${doc ? 'pointer' : 'default'};" ${doc ? `data-ver="${doc.id}"` : ''}>
         <div class="card__body flex-col gap-3"><div class="flex justify-between items-start"><span class="font-semibold">${escapeHTML(etiquetaTipo)}</span>${doc ? badgeSemaforo(doc.estado) : '<span class="badge badge--gris">No cargado</span>'}</div>
-        ${doc ? `<span class="text-xs text-tertiary">Vence: ${formatearFecha(doc.fecha_vencimiento)}</span>` : '<span class="text-xs text-tertiary">Sube este documento arriba</span>'}</div></div>`;
+        ${doc ? `<span class="text-xs text-tertiary">Vence: ${formatearFecha(doc.fecha_vencimiento)}</span><button class="btn btn--ghost btn--sm" data-versiones="${doc.id}" style="align-self:flex-start; padding:0; height:auto;">Ver versiones</button>` : '<span class="text-xs text-tertiary">Sube este documento arriba</span>'}</div></div>`;
     }).join('');
     grid.querySelectorAll('[data-ver]').forEach((card) => card.addEventListener('click', () => { const doc = certificaciones.find((c) => c.id === card.dataset.ver); abrirVistaPrevia({ bucketId: BUCKETS.DOCUMENTOS, ruta: doc.ruta_storage, nombreArchivo: doc.nombre_archivo, mimeType: doc.mime_type }); }));
+    grid.querySelectorAll('[data-versiones]').forEach((btn) => btn.addEventListener('click', (e) => { e.stopPropagation(); const doc = certificaciones.find((c) => c.id === btn.dataset.versiones); abrirModalVersiones(doc, empresaId, recargar); }));
   }
   await recargar();
   wireSelectOtro('input-tipo', 'campo-otro-tipo', 'input-otro-tipo');
@@ -2323,7 +2687,7 @@ async function vistaProveedorProductos() {
       { clave: 'nombre', titulo: 'Producto', ordenable: true, render: (f) => escapeHTML(f.nombre) },
       { clave: 'sku', titulo: 'SKU', render: (f) => `<span class="mono">${escapeHTML(f.sku)}</span>` },
       { clave: 'precio', titulo: 'Precio', render: (f) => formatearMoneda(f.precio, f.moneda) },
-      { clave: 'acciones', titulo: '', render: (f) => `<button class="btn btn--sm btn--secondary" data-editar="${f.id}">Editar</button>` },
+      { clave: 'acciones', titulo: '', render: (f) => `<div class="flex gap-2"><button class="btn btn--sm btn--secondary" data-costeo="${f.id}">Costeo</button><button class="btn btn--sm btn--secondary" data-editar="${f.id}">Editar</button></div>` },
     ], porPagina: 10, textoVacio: 'Aún no has registrado productos en tu catálogo.',
   });
 
@@ -2333,6 +2697,7 @@ async function vistaProveedorProductos() {
     productos = await listarProductosEmpresa(empresaId);
     tabla.setDatos(productos);
     contenedor.querySelectorAll('[data-editar]').forEach((btn) => btn.addEventListener('click', () => abrirModalProducto(productos.find((p) => p.id === btn.dataset.editar))));
+    contenedor.querySelectorAll('[data-costeo]').forEach((btn) => btn.addEventListener('click', () => abrirCalculadoraCosteo(productos.find((p) => p.id === btn.dataset.costeo))));
   }
   await recargar();
 
@@ -2576,8 +2941,14 @@ const RUTAS = {
 
 function rutaHomePorRol(rol) { return rol === 'proveedor' ? '/proveedor/dashboard' : '/admin/dashboard'; }
 
+let rutaQueryActual = new URLSearchParams();
+/** @returns {URLSearchParams} query params de la ruta actual (ej. ?empresa=ID) */
+function getRutaQuery() { return rutaQueryActual; }
+
 async function router() {
-  const ruta = (location.hash || '#/login').slice(1) || '/login';
+  const hashCompleto = (location.hash || '#/login').slice(1) || '/login';
+  const [ruta, queryString] = hashCompleto.split('?');
+  rutaQueryActual = new URLSearchParams(queryString || '');
   const definicion = RUTAS[ruta];
 
   if (!definicion) { location.hash = '#/login'; return; }
