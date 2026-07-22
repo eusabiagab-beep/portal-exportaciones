@@ -562,12 +562,17 @@ async function registrarUltimoAcceso(usuarioId) {
 // --------------------------------------------------------------
 let usuarioActual = null;
 
+let escuchandoCambiosAuth = false;
+
 async function inicializarSesion() {
   usuarioActual = await obtenerPerfilActual();
-  supabase.auth.onAuthStateChange(async (evento) => {
-    if (evento === 'SIGNED_OUT') { usuarioActual = null; }
-    if (evento === 'TOKEN_REFRESHED' || evento === 'USER_UPDATED') { usuarioActual = await obtenerPerfilActual(); }
-  });
+  if (!escuchandoCambiosAuth) {
+    escuchandoCambiosAuth = true;
+    supabase.auth.onAuthStateChange(async (evento) => {
+      if (evento === 'SIGNED_OUT') { usuarioActual = null; }
+      if (evento === 'TOKEN_REFRESHED' || evento === 'USER_UPDATED') { usuarioActual = await obtenerPerfilActual(); }
+    });
+  }
   return usuarioActual;
 }
 
@@ -1278,6 +1283,7 @@ async function obtenerEmpresa(empresaId) {
 }
 async function crearEmpresa(payload) {
   const usuario = getUsuarioActual();
+  if (!usuario) throw new Error('Tu sesión expiró. Recarga la página e inicia sesión de nuevo.');
   const { data, error } = await supabase.from('empresas').insert({ ...payload, creado_por: usuario.id }).select().single();
   if (error) throw new Error(mensajeErrorSupabase(error));
   await registrarHistorial({ empresaId: data.id, accion: 'empresa_creada', entidadTipo: 'empresa', entidadId: data.id, detalle: { razon_social: data.razon_social } });
@@ -1343,6 +1349,7 @@ async function listarDocumentosEmpresa(empresaId, { tipo } = {}) {
 }
 async function subirDocumento({ empresaId, archivo, tipo, fechaEmision, fechaVencimiento, otroDescripcion }) {
   const usuario = getUsuarioActual();
+  if (!usuario) throw new Error('Tu sesión expiró. Recarga la página e inicia sesión de nuevo.');
   const ruta = construirRutaStorage(empresaId, archivo.name);
   const { error: uploadError } = await supabase.storage.from(BUCKETS.DOCUMENTOS).upload(ruta, archivo);
   if (uploadError) throw new Error(mensajeErrorSupabase(uploadError));
@@ -1364,6 +1371,7 @@ async function eliminarDocumento(documentoId, empresaId) {
 /** Sube una nueva versión de un documento existente, conservando el historial de versiones anteriores. */
 async function subirNuevaVersion({ documentoId, empresaId, archivo, notaCambio }) {
   const usuario = getUsuarioActual();
+  if (!usuario) throw new Error('Tu sesión expiró. Recarga la página e inicia sesión de nuevo.');
   const ruta = construirRutaStorage(empresaId, archivo.name);
   const { error: uploadError } = await supabase.storage.from(BUCKETS.DOCUMENTOS).upload(ruta, archivo);
   if (uploadError) throw new Error(mensajeErrorSupabase(uploadError));
@@ -1411,6 +1419,7 @@ async function listarProductosEmpresa(empresaId) {
 }
 async function crearProducto(payload) {
   const usuario = getUsuarioActual();
+  if (!usuario) throw new Error('Tu sesión expiró. Recarga la página e inicia sesión de nuevo.');
   const { data, error } = await supabase.from('productos').insert({ ...payload, creado_por: usuario.id }).select().single();
   if (error) throw new Error(mensajeErrorSupabase(error));
   await registrarHistorial({ empresaId: payload.empresa_id, accion: 'producto_creado', entidadTipo: 'producto', entidadId: data.id, detalle: { nombre: data.nombre, sku: data.sku } });
@@ -1440,6 +1449,7 @@ async function listarPendientesEmpresa(empresaId, { estado } = {}) {
 }
 async function crearPendiente(payload) {
   const usuario = getUsuarioActual();
+  if (!usuario) throw new Error('Tu sesión expiró. Recarga la página e inicia sesión de nuevo.');
   const { data, error } = await supabase.from('pendientes').insert({ ...payload, creado_por: usuario.id }).select().single();
   if (error) throw new Error(mensajeErrorSupabase(error));
   await registrarHistorial({ empresaId: payload.empresa_id, accion: 'pendiente_creado', entidadTipo: 'pendiente', entidadId: data.id, detalle: { titulo: data.titulo } });
@@ -1460,6 +1470,7 @@ async function reabrirPendiente(pendienteId, empresaId) {
 }
 async function subirArchivoPendiente(pendienteId, empresaId, archivo) {
   const usuario = getUsuarioActual();
+  if (!usuario) throw new Error('Tu sesión expiró. Recarga la página e inicia sesión de nuevo.');
   const ruta = construirRutaStorage(`${empresaId}/${pendienteId}`, archivo.name);
   const { error: uploadError } = await supabase.storage.from(BUCKETS.PENDIENTES).upload(ruta, archivo);
   if (uploadError) throw new Error(mensajeErrorSupabase(uploadError));
@@ -1515,6 +1526,7 @@ function suscribirseAComentarios(empresaId, onNuevoComentario) {
 }
 async function crearComentario({ empresaId, pendienteId = null, contenido }) {
   const usuario = getUsuarioActual();
+  if (!usuario) throw new Error('Tu sesión expiró. Recarga la página e inicia sesión de nuevo.');
   const texto = normalizarTexto(contenido);
   if (!texto) throw new Error('El comentario no puede estar vacío.');
   const { data, error } = await supabase.from('comentarios').insert({ empresa_id: empresaId, pendiente_id: pendienteId, usuario_id: usuario.id, contenido: texto }).select('*, usuarios(nombre_completo, rol)').single();
