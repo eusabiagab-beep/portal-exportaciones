@@ -1483,6 +1483,32 @@ async function listarComentarios({ empresaId, pendienteId }) {
   if (error) throw new Error(mensajeErrorSupabase(error));
   return data;
 }
+// --------------------------------------------------------------
+// REALTIME GENÉRICO — usado por las vistas de admin para reflejar
+// en vivo lo que hacen los proveedores (subir documentos, crear
+// productos/pendientes, etc.). Solo una suscripción activa a la
+// vez; el router cancela la anterior en cada cambio de vista.
+// --------------------------------------------------------------
+let canalEnVivoActual = null;
+
+/**
+ * @param {{tabla:string, filtro?:string}[]} tablas  ej. [{tabla:'productos', filtro:'empresa_id=eq.X'}]
+ * @param {() => void} callback  se ejecuta en cualquier INSERT/UPDATE/DELETE
+ */
+function suscribirseEnVivo(tablas, callback) {
+  cancelarSuscripcionEnVivo();
+  let canal = supabase.channel(`live-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`);
+  tablas.forEach(({ tabla, filtro }) => {
+    canal = canal.on('postgres_changes', { event: '*', schema: 'public', table: tabla, ...(filtro ? { filter: filtro } : {}) }, callback);
+  });
+  canal.subscribe();
+  canalEnVivoActual = canal;
+}
+
+function cancelarSuscripcionEnVivo() {
+  if (canalEnVivoActual) { supabase.removeChannel(canalEnVivoActual); canalEnVivoActual = null; }
+}
+
 function suscribirseAComentarios(empresaId, onNuevoComentario) {
   const canal = supabase.channel(`comentarios-empresa-${empresaId}`).on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'comentarios', filter: `empresa_id=eq.${empresaId}` }, (payload) => onNuevoComentario(payload.new)).subscribe();
   return () => supabase.removeChannel(canal);
@@ -1650,7 +1676,7 @@ function vistaLogin() {
           <form id="form-login" novalidate>
             <div class="field" style="margin-bottom: var(--space-4);"><label class="field__label" for="email">Correo electrónico</label><input class="input" type="email" id="email" required /></div>
             <div class="field" style="margin-bottom: var(--space-2);"><label class="field__label" for="password">Contraseña</label><input class="input" type="password" id="password" required /></div>
-            <div class="flex justify-between items-center" style="margin-bottom: var(--space-6);"><span></span><a href="#/recuperar" class="text-sm" style="color: var(--color-primary); font-weight: var(--font-weight-medium);">¿Olvidaste tu contraseña?</a></div>
+            <div style="margin-bottom: var(--space-6);"></div>
             <button type="submit" class="btn btn--primary w-full" id="btn-submit">Iniciar sesión</button>
           </form>
         </div>
@@ -1875,6 +1901,8 @@ async function vistaAdminDashboard() {
   document.getElementById('lista-actividad').innerHTML = actividad.length
     ? actividad.map((a) => `<div class="flex-col gap-1" style="padding-bottom: var(--space-3); border-bottom: 1px solid var(--color-border);"><span class="text-sm"><strong>${escapeHTML(a.usuarios?.nombre_completo || 'Sistema')}</strong> — ${escapeHTML(formatearEtiqueta(a.accion))}</span><span class="text-xs text-tertiary">${tiempoRelativo(a.creado_en)}</span></div>`).join('')
     : '<div class="empty-state"><p>Sin actividad reciente.</p></div>';
+
+  suscribirseEnVivo([{ tabla: 'documentos' }, { tabla: 'pendientes' }, { tabla: 'empresas' }, { tabla: 'historial_actividad' }], () => vistaAdminDashboard());
 }
 
 async function vistaAdminEmpresas() {
@@ -1905,6 +1933,7 @@ async function vistaAdminEmpresas() {
     if (idAbrir) { const encontrada = empresas.find((e) => e.id === idAbrir); if (encontrada) abrirModalEmpresa(encontrada); }
   }
   await recargar();
+  suscribirseEnVivo([{ tabla: 'empresas' }], () => recargar());
 
   async function abrirModalEmpresa(empresaExistente = null) {
     let usuariosEmpresa = [];
@@ -2000,7 +2029,11 @@ async function vistaAdminUsuarios() {
       { clave: 'empresa', titulo: 'Empresa', render: (f) => escapeHTML(f.usuarios_empresas?.[0]?.empresas?.razon_social || '—') },
       { clave: 'ultimo_acceso', titulo: 'Último acceso', render: (f) => tiempoRelativo(f.ultimo_acceso) },
       { clave: 'activo', titulo: 'Estado', render: (f) => f.activo ? '<span class="badge badge--verde">Activo</span>' : '<span class="badge badge--rojo">Inactivo</span>' },
-      { clave: 'acciones', titulo: '', render: (f) => esAdmin() ? `<button class="btn btn--sm btn--secondary" data-toggle="${f.id}" data-activo="${f.activo}">${f.activo ? 'Desactivar' : 'Reactivar'}</button>` : '' },
+      { clave: 'acciones', titulo: '', render: (f) => esAdmin() ? `
+          <div class="flex gap-2">
+            <button class="btn btn--sm btn--secondary" data-password="${f.id}" data-nombre="${escapeHTML(f.nombre_completo)}">Cambiar contraseña</button>
+            <button class="btn btn--sm btn--secondary" data-toggle="${f.id}" data-activo="${f.activo}">${f.activo ? 'Desactivar' : 'Reactivar'}</button>
+          </div>` : '' },
     ], porPagina: 12, textoVacio: 'No hay usuarios registrados.',
   });
 
@@ -2016,8 +2049,43 @@ async function vistaAdminUsuarios() {
         });
       });
     });
+    contenedor.querySelectorAll('[data-password]').forEach((btn) => {
+      btn.addEventListener('click', () => abrirModalCambiarPassword(btn.dataset.password, btn.dataset.nombre));
+    });
   }
   await recargar();
+}
+
+/** Cambia la contraseña de cualquier usuario vía Edge Function (requiere service_role, nunca expuesta al navegador). */
+function abrirModalCambiarPassword(usuarioId, nombreUsuario) {
+  const cuerpoHTML = `
+    <p class="text-sm text-secondary" style="margin-bottom: var(--space-4);">Vas a establecer una nueva contraseña para <strong>${escapeHTML(nombreUsuario)}</strong>. Compártesela de forma segura.</p>
+    <form id="form-cambiar-password" class="flex-col gap-4">
+      <div class="field"><label class="field__label">Nueva contraseña</label><input class="input" type="password" id="nueva-password" minlength="8" required /></div>
+      <div class="field"><label class="field__label">Confirmar contraseña</label><input class="input" type="password" id="confirmar-password" minlength="8" required /></div>
+    </form>`;
+  abrirModal({
+    titulo: 'Cambiar contraseña', cuerpoHTML,
+    acciones: [
+      { texto: 'Cancelar', variante: 'secondary', onClick: (cerrar) => cerrar() },
+      { texto: 'Guardar nueva contraseña', variante: 'primary', onClick: async (cerrar) => {
+        const p1 = document.getElementById('nueva-password').value;
+        const p2 = document.getElementById('confirmar-password').value;
+        if (p1.length < 8) return toast.error('La contraseña debe tener al menos 8 caracteres.');
+        if (p1 !== p2) return toast.error('Las contraseñas no coinciden.');
+        try {
+          const { data: sesion } = await supabase.auth.getSession();
+          const { data, error } = await supabase.functions.invoke('cambiar-password', {
+            body: { usuarioId, nuevaPassword: p1 },
+            headers: { Authorization: `Bearer ${sesion.session.access_token}` },
+          });
+          if (error || data?.error) throw new Error(data?.error || error.message);
+          toast.exito('Contraseña actualizada correctamente.');
+          cerrar();
+        } catch (err) { toast.error(err.message || 'No se pudo cambiar la contraseña.'); }
+      } },
+    ],
+  });
 }
 
 async function vistaAdminPendientes() {
@@ -2061,6 +2129,7 @@ async function vistaAdminPendientes() {
     contenedor.querySelectorAll('[data-cerrar]').forEach((btn) => btn.addEventListener('click', async () => { await cerrarPendiente(btn.dataset.cerrar, empresaId); toast.exito('Pendiente cerrado.'); await recargar(); }));
     contenedor.querySelectorAll('[data-reabrir]').forEach((btn) => btn.addEventListener('click', async () => { await reabrirPendiente(btn.dataset.reabrir, empresaId); toast.exito('Pendiente reabierto.'); await recargar(); }));
     contenedor.querySelectorAll('[data-editar]').forEach((btn) => btn.addEventListener('click', () => abrirModalEdicion(pendientesActuales.find((p) => p.id === btn.dataset.editar))));
+    suscribirseEnVivo([{ tabla: 'pendientes', filtro: `empresa_id=eq.${empresaId}` }], () => recargar());
   }
   selectEmpresa.addEventListener('change', recargar);
   if (empresas.length) await recargar();
@@ -2200,6 +2269,7 @@ async function vistaAdminDocumentos() {
     contenedor.querySelectorAll('[data-ver]').forEach((btn) => btn.addEventListener('click', () => { const doc = documentosActuales.find((d) => d.id === btn.dataset.ver); abrirVistaPrevia({ bucketId: BUCKETS.DOCUMENTOS, ruta: doc.ruta_storage, nombreArchivo: doc.nombre_archivo, mimeType: doc.mime_type }); }));
     contenedor.querySelectorAll('[data-eliminar]').forEach((btn) => btn.addEventListener('click', () => confirmarAccion({ titulo: 'Eliminar documento', mensaje: '¿Seguro que deseas eliminar este documento?', textoConfirmar: 'Eliminar', onConfirmar: async () => { await eliminarDocumento(btn.dataset.eliminar, empresaId); toast.exito('Documento eliminado.'); await recargar(); } })));
     contenedor.querySelectorAll('[data-versiones]').forEach((btn) => btn.addEventListener('click', () => { const doc = documentosActuales.find((d) => d.id === btn.dataset.versiones); abrirModalVersiones(doc, empresaId, recargar); }));
+    suscribirseEnVivo([{ tabla: 'documentos', filtro: `empresa_id=eq.${empresaId}` }], () => recargar());
   }
   selectEmpresa.addEventListener('change', recargar);
   if (empresas.length) await recargar();
@@ -2258,6 +2328,7 @@ async function vistaAdminProductos() {
     tabla.setDatos(productosActuales);
     contenedor.querySelectorAll('[data-editar]').forEach((btn) => btn.addEventListener('click', () => abrirModalProducto(productosActuales.find((p) => p.id === btn.dataset.editar))));
     contenedor.querySelectorAll('[data-costeo]').forEach((btn) => btn.addEventListener('click', () => abrirCalculadoraCosteo(productosActuales.find((p) => p.id === btn.dataset.costeo))));
+    suscribirseEnVivo([{ tabla: 'productos', filtro: `empresa_id=eq.${empresaId}` }], () => recargar());
   }
   selectEmpresa.addEventListener('change', recargar);
   if (empresas.length) await recargar();
@@ -2501,6 +2572,12 @@ async function vistaProveedorDashboard() {
       { clave: 'estado', titulo: 'Estado', render: (f) => badgeSemaforo(f.estado) },
     ], porPagina: 6, textoVacio: 'Ninguna certificación vence pronto.',
   }).setDatos(certificaciones);
+
+  suscribirseEnVivo([
+    { tabla: 'documentos', filtro: `empresa_id=eq.${empresaId}` },
+    { tabla: 'pendientes', filtro: `empresa_id=eq.${empresaId}` },
+    { tabla: 'empresas', filtro: `id=eq.${empresaId}` },
+  ], () => vistaProveedorDashboard());
 }
 
 
@@ -2768,6 +2845,7 @@ async function vistaProveedorPendientes() {
     pendientes = await listarPendientesEmpresa(empresaId, filtroEstado ? { estado: filtroEstado } : {});
     tabla.setDatos(pendientes);
     contenedor.querySelectorAll('[data-detalle]').forEach((btn) => btn.addEventListener('click', () => abrirDetalle(pendientes.find((p) => p.id === btn.dataset.detalle))));
+    suscribirseEnVivo([{ tabla: 'pendientes', filtro: `empresa_id=eq.${empresaId}` }], () => recargar());
   }
   await recargar();
 
@@ -2947,6 +3025,7 @@ let rutaQueryActual = new URLSearchParams();
 function getRutaQuery() { return rutaQueryActual; }
 
 async function router() {
+  cancelarSuscripcionEnVivo();
   const hashCompleto = (location.hash || '#/login').slice(1) || '/login';
   const [ruta, queryString] = hashCompleto.split('?');
   rutaQueryActual = new URLSearchParams(queryString || '');
