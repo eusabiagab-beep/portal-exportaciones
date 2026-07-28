@@ -531,7 +531,7 @@ async function crearUsuario(datos) {
     headers: { Authorization: `Bearer ${sesion.session.access_token}` },
   });
 
-  if (error || data?.error) return { ok: false, error: data?.error || 'No se pudo crear el usuario.' };
+  if (error || !data?.ok) return { ok: false, error: data?.error || 'La función crear-usuario no respondió lo esperado. Revisa que el código desplegado en Supabase sea el correcto (no el de ejemplo).' };
   return { ok: true };
 }
 
@@ -2300,7 +2300,7 @@ function abrirModalCambiarPassword(usuarioId, nombreUsuario) {
             body: { usuarioId, nuevaPassword: p1 },
             headers: { Authorization: `Bearer ${sesion.session.access_token}` },
           });
-          if (error || data?.error) throw new Error(data?.error || error.message);
+          if (error || !data?.ok) throw new Error(data?.error || 'La función cambiar-password no respondió lo esperado. Revisa que el código desplegado en Supabase sea el correcto.');
           toast.exito('Contraseña actualizada correctamente.');
           cerrar();
         } catch (err) { toast.error(err.message || 'No se pudo cambiar la contraseña.'); }
