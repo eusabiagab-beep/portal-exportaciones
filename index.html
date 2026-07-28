@@ -508,23 +508,19 @@ async function crearUsuario(datos) {
   const perfilAdmin = await obtenerPerfilActual();
   if (!perfilAdmin || perfilAdmin.rol !== 'admin') return { ok: false, error: 'Solo un administrador puede crear usuarios.' };
 
-  const { data: sesionAdmin } = await supabase.auth.getSession();
-  const { data: signUpData, error: signUpError } = await supabase.auth.signUp({ email: datos.email.trim().toLowerCase(), password: datos.password });
-  if (signUpError) return { ok: false, error: mensajeErrorSupabase(signUpError) };
-
-  if (sesionAdmin?.session) {
-    await supabase.auth.setSession({ access_token: sesionAdmin.session.access_token, refresh_token: sesionAdmin.session.refresh_token });
-  }
-
-  const { error: perfilError } = await supabase.from('usuarios').insert({
-    id: signUpData.user.id, email: datos.email.trim().toLowerCase(), nombre_completo: datos.nombre_completo, rol: datos.rol,
+  const { data: sesion } = await supabase.auth.getSession();
+  const { data, error } = await supabase.functions.invoke('crear-usuario', {
+    body: {
+      email: datos.email.trim().toLowerCase(),
+      password: datos.password,
+      nombreCompleto: datos.nombre_completo,
+      rol: datos.rol,
+      empresaId: datos.empresa_id || null,
+    },
+    headers: { Authorization: `Bearer ${sesion.session.access_token}` },
   });
-  if (perfilError) return { ok: false, error: mensajeErrorSupabase(perfilError) };
 
-  if (datos.rol === 'proveedor' && datos.empresa_id) {
-    const { error: asignacionError } = await supabase.from('usuarios_empresas').insert({ usuario_id: signUpData.user.id, empresa_id: datos.empresa_id });
-    if (asignacionError) return { ok: false, error: mensajeErrorSupabase(asignacionError) };
-  }
+  if (error || data?.error) return { ok: false, error: data?.error || 'No se pudo crear el usuario.' };
   return { ok: true };
 }
 
