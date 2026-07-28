@@ -1229,6 +1229,42 @@ function abrirCalculadoraCosteo(producto) {
 }
 
 // --------------------------------------------------------------
+// COMBO BUSCABLE — dropdown con búsqueda en vivo (para filtros
+// con muchas opciones, ej. tipo de documento).
+// --------------------------------------------------------------
+function crearComboBuscable({ contenedor, opciones, placeholder = 'Buscar…', valorInicialTexto = '', onSeleccionar }) {
+  contenedor.innerHTML = `
+    <div style="position:relative;">
+      <input class="input" type="text" placeholder="${escapeHTML(placeholder)}" data-combo-input autocomplete="off" value="${escapeHTML(valorInicialTexto)}" />
+      <div class="notif-panel hidden" data-combo-panel style="width:100%; max-height:280px; overflow-y:auto;"></div>
+    </div>`;
+  const input = contenedor.querySelector('[data-combo-input]');
+  const panel = contenedor.querySelector('[data-combo-panel]');
+
+  function pintarOpciones(filtro = '') {
+    const q = filtro.toLowerCase();
+    const filtradas = opciones.filter((o) => o.texto.toLowerCase().includes(q));
+    panel.innerHTML = filtradas.length
+      ? filtradas.map((o) => `<a data-valor="${o.valor}" class="notif-item" style="cursor:pointer; display:block;">${escapeHTML(o.texto)}</a>`).join('')
+      : '<div class="empty-state" style="padding:16px;"><p>Sin coincidencias.</p></div>';
+    panel.querySelectorAll('[data-valor]').forEach((el) => {
+      el.addEventListener('click', () => {
+        const opcion = opciones.find((o) => o.valor === el.dataset.valor);
+        input.value = opcion ? opcion.texto : '';
+        panel.classList.add('hidden');
+        onSeleccionar(el.dataset.valor);
+      });
+    });
+  }
+
+  input.addEventListener('focus', () => { pintarOpciones(input.value === valorInicialTexto ? '' : input.value); panel.classList.remove('hidden'); });
+  input.addEventListener('input', () => pintarOpciones(input.value));
+  document.addEventListener('click', (e) => { if (!contenedor.contains(e.target)) panel.classList.add('hidden'); });
+}
+
+const TIPOS_DOCUMENTO_TODOS = ['FDA', 'USDA', 'CFIA', 'HACCP', 'SQF', 'BRCGS', 'FSSC22000', 'ISO22000', 'KOSHER', 'HALAL', 'ORGANIC', 'NON_GMO', 'CATALOGO_PDF', 'LISTA_PRECIOS', 'FICHA_TECNICA', 'ESPECIFICACIONES', 'ETIQUETAS', 'FOTOGRAFIA', 'VIDEO', 'OTRO'];
+
+// --------------------------------------------------------------
 // SERVICES: historial (primero, porque otros lo usan)
 // --------------------------------------------------------------
 async function registrarHistorial({ empresaId = null, accion, entidadTipo = null, entidadId = null, detalle = null }) {
@@ -2234,7 +2270,7 @@ async function vistaAdminPendientes() {
 async function vistaAdminDocumentos() {
   const contenido = await renderShell('/admin/documentos');
   contenido.innerHTML = `
-    <div class="page-header"><div><div class="page-header__eyebrow">Administración</div><h1>Documentos</h1></div><div class="page-header__actions"><select class="select" id="filtro-empresa" style="width:240px;"></select></div></div>
+    <div class="page-header"><div><div class="page-header__eyebrow">Administración</div><h1>Documentos</h1></div><div class="page-header__actions"><div id="combo-filtro-tipo" style="width:260px;"></div><select class="select" id="filtro-empresa" style="width:240px;"></select></div></div>
     <div class="card" style="margin-bottom: var(--space-6);" id="card-subida">
       <div class="card__header"><h3>Subir documento</h3></div>
       <div class="card__body flex-col gap-4">
@@ -2277,10 +2313,18 @@ async function vistaAdminDocumentos() {
   });
 
   let documentosActuales = [];
+  let tipoFiltro = '';
+  crearComboBuscable({
+    contenedor: document.getElementById('combo-filtro-tipo'),
+    placeholder: 'Filtrar por tipo de documento…',
+    opciones: [{ valor: '', texto: 'Todos los tipos' }, ...TIPOS_DOCUMENTO_TODOS.map((t) => ({ valor: t, texto: formatearEtiqueta(t) }))],
+    onSeleccionar: (valor) => { tipoFiltro = valor; recargar(); },
+  });
+
   async function recargar() {
     const empresaId = selectEmpresa.value;
     if (!empresaId) return;
-    documentosActuales = await listarDocumentosEmpresa(empresaId);
+    documentosActuales = await listarDocumentosEmpresa(empresaId, tipoFiltro ? { tipo: tipoFiltro } : {});
     tabla.setDatos(documentosActuales);
     contenedor.querySelectorAll('[data-ver]').forEach((btn) => btn.addEventListener('click', () => { const doc = documentosActuales.find((d) => d.id === btn.dataset.ver); abrirVistaPrevia({ bucketId: BUCKETS.DOCUMENTOS, ruta: doc.ruta_storage, nombreArchivo: doc.nombre_archivo, mimeType: doc.mime_type }); }));
     contenedor.querySelectorAll('[data-eliminar]').forEach((btn) => btn.addEventListener('click', () => confirmarAccion({ titulo: 'Eliminar documento', mensaje: '¿Seguro que deseas eliminar este documento?', textoConfirmar: 'Eliminar', onConfirmar: async () => { await eliminarDocumento(btn.dataset.eliminar, empresaId); toast.exito('Documento eliminado.'); await recargar(); } })));
