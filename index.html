@@ -471,6 +471,7 @@ const MENSAJES_ERROR_AMIGABLES = {
   '23505': 'Ya existe un registro con esos datos (duplicado).',
   '23503': 'No se puede completar: hay información relacionada que lo impide.',
   '42501': 'No tienes permisos para realizar esta acción.',
+  '22P02': 'Uno de los campos numéricos tiene un valor inválido. Revisa peso, precio y vida útil.',
   PGRST301: 'Tu sesión expiró. Inicia sesión de nuevo.',
 };
 
@@ -608,6 +609,13 @@ function construirRutaStorage(carpetaId, nombreOriginal) {
   return `${carpetaId}/${sufijo}-${nombreLimpio}`;
 }
 function normalizarTexto(texto) { return String(texto || '').trim().replace(/\s+/g, ' '); }
+
+/** Convierte a null los campos numéricos que llegaron como "" desde un <input type="number"> vacío — Postgres rechaza "" en columnas numeric/integer. */
+function normalizarCamposNumericos(datos, campos) {
+  const copia = { ...datos };
+  campos.forEach((c) => { if (copia[c] === '') copia[c] = null; });
+  return copia;
+}
 
 // --------------------------------------------------------------
 // UTILS: formatters
@@ -2368,8 +2376,9 @@ async function vistaAdminProductos() {
     acciones.push({
       texto: productoExistente ? 'Guardar cambios' : 'Crear producto', variante: 'primary',
       onClick: async (cerrar) => {
-        const datos = Object.fromEntries(new FormData(document.getElementById('form-producto')).entries());
-        if (!esRequerido(datos.nombre) || !esRequerido(datos.sku)) return toast.error('Nombre y SKU son obligatorios.');
+        const datosCrudos = Object.fromEntries(new FormData(document.getElementById('form-producto')).entries());
+        if (!esRequerido(datosCrudos.nombre) || !esRequerido(datosCrudos.sku)) return toast.error('Nombre y SKU son obligatorios.');
+        const datos = normalizarCamposNumericos(datosCrudos, ['peso', 'precio', 'vida_util_dias']);
         try {
           if (productoExistente) { await actualizarProducto(productoExistente.id, selectEmpresa.value, datos); toast.exito('Producto actualizado.'); }
           else { await crearProducto({ ...datos, empresa_id: selectEmpresa.value }); toast.exito('Producto creado.'); }
@@ -2807,8 +2816,9 @@ async function vistaProveedorProductos() {
     const acciones = [
       { texto: 'Cancelar', variante: 'secondary', onClick: (cerrar) => cerrar() },
       { texto: productoExistente ? 'Guardar cambios' : 'Crear producto', variante: 'primary', onClick: async (cerrar) => {
-        const datos = Object.fromEntries(new FormData(document.getElementById('form-producto')).entries());
-        if (!esRequerido(datos.nombre) || !esRequerido(datos.sku)) return toast.error('Nombre y SKU son obligatorios.');
+        const datosCrudos = Object.fromEntries(new FormData(document.getElementById('form-producto')).entries());
+        if (!esRequerido(datosCrudos.nombre) || !esRequerido(datosCrudos.sku)) return toast.error('Nombre y SKU son obligatorios.');
+        const datos = normalizarCamposNumericos(datosCrudos, ['peso', 'precio', 'vida_util_dias']);
         try {
           if (productoExistente) await actualizarProducto(productoExistente.id, empresaId, datos);
           else await crearProducto({ ...datos, empresa_id: empresaId });
